@@ -601,6 +601,49 @@ const TM = (() => {
     return { o: p[0], n: unit(n) };
   }
 
+  // mặt phẳng cắt của thiết diện: qua 3 điểm, hoặc qua điểm/đường và song song, vuông góc với đường, mặt cho trước
+  const asLines = (x) => (!Array.isArray(x) ? [] : Array.isArray(x[0]) ? x.filter(Array.isArray) : x.length >= 2 ? [x] : []);
+  function sectionPlane(M, it) {
+    const qua = (Array.isArray(it.qua) ? it.qua : it.qua ? [it.qua] : []).concat(Array.isArray(it.chua) ? it.chua : []);
+    const P = [...new Set(qua)].map((n) => [n, M.get(n)]);
+    const R = Math.max(1, M.radius || 1);
+    const ssLines = asLines(it.song_song), mat = it.song_song_mat, vgL = asLines(it.vuong_goc)[0], vgM = it.vuong_goc_mat;
+    if (!P.length) throw new GeoError("Mặt phẳng cắt cần đi qua ít nhất một điểm");
+    const o = P[0][1];
+    const checkPts = (n) => {
+      for (const [nm, X] of P) if (Math.abs(dot(sub(X, o), n)) > 1e-6 * R) throw new GeoError(`Không có mặt phẳng nào thỏa đồng thời các điều kiện (điểm ${nm})`);
+    };
+    let n = null;
+    if (Array.isArray(mat) && mat.length >= 3) n = planeOf(M, mat).n;
+    else if (vgL) n = unit(sub(M.get(vgL[1]), M.get(vgL[0])));
+    if (n) {
+      if (ssLines.some(([a, b]) => Math.abs(dot(unit(sub(M.get(b), M.get(a))), n)) > 1e-6)) throw new GeoError("Điều kiện song song mâu thuẫn với điều kiện còn lại");
+      checkPts(n);
+      return { o, n: unit(n) };
+    }
+    const dirs = [];
+    for (let i = 1; i < P.length; i++) dirs.push(sub(P[i][1], o));
+    for (const [a, b] of ssLines) dirs.push(sub(M.get(b), M.get(a)));
+    if (Array.isArray(vgM) && vgM.length >= 3) dirs.push(planeOf(M, vgM).n);
+    for (let i = 0; i < dirs.length && !n; i++) for (let j = i + 1; j < dirs.length && !n; j++) {
+      const c = cross(dirs[i], dirs[j]);
+      if (len(c) > 1e-7 * len(dirs[i]) * len(dirs[j])) n = unit(c);
+    }
+    if (!n) throw new GeoError("Chưa đủ điều kiện để xác định mặt phẳng cắt");
+    for (const d of dirs) if (Math.abs(dot(unit(d), n)) > 1e-6) throw new GeoError("Các điều kiện của mặt phẳng cắt mâu thuẫn nhau");
+    return { o, n };
+  }
+  // tách "SB", "A'C'", "AA1" thành hai tên điểm đã có
+  function splitPair(M, key) {
+    if (Array.isArray(key)) return key.length === 2 ? key : null;
+    const s = String(key).replace(/\s+/g, "");
+    for (let i = 1; i < s.length; i++) {
+      const a = s.slice(0, i), b = s.slice(i);
+      if (M.pts.has(a) && M.pts.has(b)) return [a, b];
+    }
+    return null;
+  }
+
   function baseXY(it, E) {
     const k = it.kieu;
     const sq3 = Math.sqrt(3);
@@ -687,7 +730,7 @@ const TM = (() => {
     const M = {
       pts: new Map(), pstep: new Map(), solid: null, segs: [], polys: [], marks: [], items: [],
       drag: new Map(), errors: [], ratios: new Map(), dragged: new Set(Object.keys(ov)), maxStep: 1,
-      pv, ov, opts,
+      pv, ov, opts, spec, sections: [],
     };
     M.get = (n) => {
       if (typeof n !== "string" || !M.pts.has(n)) throw new GeoError(`Chưa có điểm "${n}"`);
@@ -880,11 +923,25 @@ const TM = (() => {
           case "doan": { const [a, b] = it.cua || []; M.get(a); M.get(b); if (!dup) addSeg(a, b, step, "extra"); break; }
           case "thiet_dien": {
             if (!M.solid) throw new GeoError("Cần khai báo khối (chóp hoặc lăng trụ) trước khi tìm thiết diện");
-            const pl = planeOf(M, it.qua);
+            const pl = sectionPlane(M, it);
             const poly = sectionPolygon(M, pl);
             if (poly.length < 3) throw new GeoError("Mặt phẳng không cắt khối theo một đa giác");
             M.polys.push({ kind: "sec", pts: poly, step });
             for (let j = 0; j < poly.length; j++) M.segs.push({ A: poly[j], B: poly[(j + 1) % poly.length], step, kind: "sec" });
+            // đề đặt tên giao điểm, ví dụ "(P) cắt SB, SD tại H, K": dinh = {"SB": "H", "SD": "K"}
+            const named = Array.isArray(it.dinh) ? it.dinh.map((x) => [x?.duong || x?.canh, x?.ten]) : Object.entries(it.dinh || {});
+            for (const [key, nm] of named) {
+              const ab = splitPair(M, key);
+              if (!ab) throw new GeoError(`Không hiểu đường "${key}" trong tên đỉnh thiết diện`);
+              const A = M.get(ab[0]), B = M.get(ab[1]), u = sub(B, A), den = dot(pl.n, u);
+              let X = poly.find((Q) => len(cross(sub(Q, A), u)) < 1e-6 * Math.max(1, dot(u, u)));
+              if (!X) {
+                if (Math.abs(den) < 1e-9 * len(u)) throw new GeoError(`Mặt phẳng cắt song song với ${ab.join("")}`);
+                X = add(A, mul(u, dot(pl.n, sub(pl.o, A)) / den));
+              }
+              if (!M.pts.has(nm)) setPt(nm, X, step);
+            }
+            M.sections.push({ pl, poly, it, step });
             break;
           }
           case "to_mat": {
@@ -1003,6 +1060,84 @@ const TM = (() => {
     return area * Math.abs(dot(sub(M.get(S.top[0]), pl.o), pl.n));
   }
 
+  // giá trị lớn nhất, nhỏ nhất của một đại lượng khi tham số "bien" chạy trong [tu, den]: quét rồi thu hẹp (lát cắt vàng)
+  const OPT_CACHE = new Map();
+  function optimize(M, c, inner) {
+    const spec = M.spec;
+    if (!spec) throw new GeoError("Thiếu đề để khảo sát");
+    const bien = String(c.bien || "x").trim();
+    const params = normParams(spec.tham_so);
+    if (!(bien in params)) throw new GeoError(`Chưa có tham số "${bien}" để cho thay đổi`);
+    const locked = M.opts?.locked || new Set();
+    const pv0 = M.pv || {};
+    // giá trị hiện tại của mọi tham số (tham số giải từ điều kiện dùng làm điểm xuất phát)
+    const free = Object.fromEntries(Object.keys(params).map((k) => [k, pv0[k] ?? params[k].val]));
+    const keyFree = Object.fromEntries(Object.keys(params).filter((k) => !locked.has(k) && k !== bien).map((k) => [k, free[k]]));
+    const ev = (x, d) => (x == null || x === "" ? d : evalExpr(x, pv0));
+    let lo = ev(c.tu, params[bien].min), hi = ev(c.den, params[bien].max);
+    if (!(hi > lo)) throw new GeoError("Khoảng của biến không hợp lệ");
+    const key = JSON.stringify([spec.dung, spec.dieu_kien, c, keyFree]);
+    if (OPT_CACHE.has(key)) return OPT_CACHE.get(key);
+    const sgn = c.tim === "min" ? 1 : -1;
+    const hasCond = Array.isArray(spec.dieu_kien) && spec.dieu_kien.length > 0;
+    let slow = false;
+    const val = (x) => {
+      try {
+        let pv;
+        if (slow) pv = solve(spec, params, { ...free, [bien]: x }, {}).pv;
+        else pv = { ...pv0, [bien]: x };
+        const M2 = build(spec, pv, {}, { locked });
+        if (M2.errors.length) { return NaN; }
+        const v = measure(inner, M2).v;
+        return isFinite(v) ? v : NaN;
+      } catch { return NaN; }
+    };
+    const run = () => {
+      const N = slow ? 40 : 72, eps = (hi - lo) * 1e-9;
+      let bi = -1, bv = Infinity;
+      const xs = [];
+      for (let k = 0; k <= N; k++) xs.push(lo + ((hi - lo) * k) / N);
+      xs[0] += eps; xs[N] -= eps;
+      const fs = xs.map((x) => sgn * val(x));
+      fs.forEach((f, k) => { if (isFinite(f) && f < bv) { bv = f; bi = k; } });
+      if (bi < 0) throw new GeoError("Không khảo sát được đại lượng trên khoảng đã cho");
+      let a = xs[Math.max(0, bi - 1)], b = xs[Math.min(N, bi + 1)];
+      const gr = (Math.sqrt(5) - 1) / 2;
+      let x1 = b - gr * (b - a), x2 = a + gr * (b - a), f1 = sgn * val(x1), f2 = sgn * val(x2);
+      for (let it = 0; it < 70 && b - a > 1e-13 * Math.max(1, Math.abs(a)); it++) {
+        if (!(f1 <= f2) && isFinite(f2)) { a = x1; x1 = x2; f1 = f2; x2 = a + gr * (b - a); f2 = sgn * val(x2); }
+        else { b = x2; x2 = x1; f2 = f1; x1 = b - gr * (b - a); f1 = sgn * val(x1); }
+      }
+      let at = (a + b) / 2, fv = sgn * val(at);
+      if (!(fv <= bv)) { at = xs[bi]; fv = bv; }
+      // vị trí chính xác hơn: nghiệm của đạo hàm (sai phân trung tâm) quanh điểm vừa tìm
+      {
+        const L = hi - lo, h = 1e-6 * L, dfun = (x) => val(x + h) - val(x - h);
+        let u = Math.max(lo + h, at - 2e-4 * L), w = Math.min(hi - h, at + 2e-4 * L), du = dfun(u), dw = dfun(w);
+        if (isFinite(du) && isFinite(dw) && Math.sign(du) !== Math.sign(dw) && du !== 0) {
+          for (let i = 0; i < 60; i++) { const m = (u + w) / 2, dm = dfun(m); if (!isFinite(dm)) break; if (Math.sign(dm) === Math.sign(du)) { u = m; du = dm; } else w = m; }
+          const xr = (u + w) / 2, fr = sgn * val(xr);
+          if (isFinite(fr) && fr <= fv + 1e-12 * Math.max(1, Math.abs(fv))) { at = xr; fv = Math.min(fv, fr); }
+        }
+      }
+      // đạt tại đầu mút thì lấy đúng đầu mút
+      for (const e of [lo, hi]) { const fe = sgn * val(e); if (isFinite(fe) && fe <= fv + 1e-12 * Math.max(1, Math.abs(fv))) { at = e; fv = fe; } }
+      return { v: sgn * fv, at };
+    };
+    let r = run();
+    if (hasCond) {
+      // điều kiện có thể phụ thuộc biến: giải lại tại điểm tối ưu, nếu khác thì khảo sát chậm (giải điều kiện ở mỗi bước)
+      const so = solve(spec, params, { ...free, [bien]: r.at }, {});
+      const moved = [...locked].some((k) => Math.abs((so.pv[k] ?? 0) - (pv0[k] ?? 0)) > 1e-7 * Math.max(1, Math.abs(pv0[k] ?? 0)));
+      if (moved) { slow = true; r = run(); }
+    }
+    const tol = (hi - lo) * 1e-6;
+    const out = { v: r.v, at: r.at, bien, edge: Math.abs(r.at - lo) < tol ? "lo" : Math.abs(r.at - hi) < tol ? "hi" : null };
+    if (OPT_CACHE.size > 60) OPT_CACHE.clear();
+    OPT_CACHE.set(key, out);
+    return out;
+  }
+
   function measure(c, M) {
     const g = (n) => M.get(n);
     switch (c.loai) {
@@ -1052,7 +1187,37 @@ const TM = (() => {
         return { v: volume(M), kind: "volume", label: `Thể tích ${name}` };
       }
       case "dien_tich": {
+        if (c.thiet_dien != null && c.thiet_dien !== false) {
+          const sec = M.sections[typeof c.thiet_dien === "number" ? c.thiet_dien : 0];
+          if (!sec) throw new GeoError("Chưa có thiết diện (thêm bước thiet_dien)");
+          return { v: polyArea(sec.poly), kind: "area", label: "Diện tích thiết diện" };
+        }
         return { v: polyArea((c.cua || []).map(g)), kind: "area", label: `Diện tích ${joinNames(c.cua)}` };
+      }
+      case "chu_vi": {
+        let ps, lab;
+        if (c.thiet_dien != null && c.thiet_dien !== false) {
+          const sec = M.sections[typeof c.thiet_dien === "number" ? c.thiet_dien : 0];
+          if (!sec) throw new GeoError("Chưa có thiết diện (thêm bước thiet_dien)");
+          ps = sec.poly; lab = "Chu vi thiết diện";
+        } else { ps = (c.cua || []).map(g); lab = `Chu vi ${joinNames(c.cua)}`; }
+        let v = 0;
+        for (let i = 0; i < ps.length; i++) v += len(sub(ps[(i + 1) % ps.length], ps[i]));
+        return { v, kind: "length", label: lab };
+      }
+      case "ti_so": {
+        const [a, b] = c.tu || [], [p, q] = c.mau || [];
+        const d = len(sub(g(q), g(p)));
+        if (d < 1e-12) throw new GeoError("Mẫu số của tỉ số bằng 0");
+        return { v: len(sub(g(b), g(a))) / d, kind: "ratio", label: `Tỉ số ${a}${b}/${p}${q}` };
+      }
+      case "cuc_tri": {
+        const inner = c.cua || c.dai_luong;
+        if (!inner || typeof inner !== "object" || inner.loai === "cuc_tri") throw new GeoError("Thiếu đại lượng cần tìm giá trị lớn nhất, nhỏ nhất");
+        const m0 = measure(inner, M);
+        const r = optimize(M, c, inner);
+        const lab = m0.label.charAt(0).toLowerCase() + m0.label.slice(1);
+        return { v: r.v, kind: m0.kind, label: `Giá trị ${c.tim === "min" ? "nhỏ" : "lớn"} nhất của ${lab}`, at: r.at, bien: r.bien, edge: r.edge, opt: c.tim === "min" ? "min" : "max" };
       }
       case "mat_cau": {
         const pts = c.dinh && Array.isArray(c.day) ? [c.dinh, ...c.day] : null;
@@ -1130,7 +1295,20 @@ const TM = (() => {
         }
         prevX = x; prevF = fx;
       }
-      return null;
+      // không đổi dấu: điều kiện có thể chỉ chạm (ví dụ góc lớn nhất bằng 90°): tìm cực tiểu của |f|
+      let bk = -1, bf = Infinity;
+      const fs = xs.map((x) => Math.abs(f(x)));
+      fs.forEach((v, k) => { if (isFinite(v) && v < bf) { bf = v; bk = k; } });
+      if (bk < 0 || bf > 0.05 * it.scale) return null;
+      let a = xs[Math.max(0, bk - 1)], b = xs[Math.min(N, bk + 1)];
+      const gr = (Math.sqrt(5) - 1) / 2, af = (x) => { const v = Math.abs(f(x)); return isFinite(v) ? v : Infinity; };
+      let x1 = b - gr * (b - a), x2 = a + gr * (b - a), f1 = af(x1), f2 = af(x2);
+      for (let i = 0; i < 90; i++) {
+        if (f1 < f2) { b = x2; x2 = x1; f2 = f1; x1 = b - gr * (b - a); f1 = af(x1); }
+        else { a = x1; x1 = x2; f1 = f2; x2 = a + gr * (b - a); f2 = af(x2); }
+      }
+      const xm = (a + b) / 2;
+      return af(xm) < 1e-7 * it.scale ? xm : null;
     };
     const rangeOf = (it) => (Array.isArray(it.c.khoang) && it.c.khoang.length === 2 ? it.c.khoang.map(Number) : null);
     const roots = new Map();
@@ -1361,7 +1539,13 @@ const TM = (() => {
       }
       // hai cạnh chung đỉnh gần trùng nhau (dưới 7°) rất khó nhìn
       const tight = Math.max(0, 0.122 - minAng) / 0.122;
-      const score = Math.min(minPP, 0.6 * R) / R + 0.8 * Math.min(minPS, 0.4 * R) / R + 0.9 * Math.min(minAng, 0.42) / 0.42 - 0.35 * tight - pen;
+      // thiết diện không được nhìn gần như "nằm nghiêng thành một đường"
+      let secPen = 0;
+      if (M.sections && M.sections.length) {
+        const bxy = cross(B.bx, B.by), lb = len(bxy) || 1;
+        for (const sc of M.sections) { const r = Math.abs(dot(sc.pl.n, bxy)) / lb; secPen += 0.7 * Math.max(0, 0.45 - r) / 0.45; }
+      }
+      const score = Math.min(minPP, 0.6 * R) / R + 0.8 * Math.min(minPS, 0.4 * R) / R + 0.9 * Math.min(minAng, 0.42) / 0.42 - 0.35 * tight - pen - secPen;
       if (opts.debug) console.log("cand", yawDeg.toFixed(1), "pp", (Math.min(minPP, 0.6 * R) / R).toFixed(3), "ps", (0.8 * Math.min(minPS, 0.4 * R) / R).toFixed(3), "ang", (0.9 * Math.min(minAng, 0.42) / 0.42).toFixed(3), angAt, (minAng / DEG).toFixed(1), "skew", (skew / DEG).toFixed(1), "pen", pen.toFixed(2), "=", score.toFixed(3));
       if (score > best.score) best = { yaw: yawDeg, pitch: pd, skew, score };
     }
@@ -1389,7 +1573,8 @@ const TM = (() => {
     if (!isFinite(r)) return null;
     const sg = r < 0 ? -1 : 1, x = Math.abs(r);
     if (x < 1e-12) return { p: 0, q: 1, s: 1 };
-    const fr = ratApprox(x * x);
+    // mẫu nhỏ trước; mẫu lớn (như 13√87/320) chỉ nhận khi khớp rất sát
+    const fr = ratApprox(x * x) || ratApprox(x * x, 400000, 2e-14);
     if (!fr) return null;
     const [n, d] = fr;
     // √(n/d) = √(n·d)/d; tách thừa số chính phương của n·d
@@ -1401,15 +1586,64 @@ const TM = (() => {
     return { p: (sg * k) / g, q: d / g, s: t };
   }
   const SUP = { 2: "²", 3: "³" };
+  // tổng hai căn, ví dụ (√7 + √3)/2 (chu vi, diện tích thiết diện)
+  const SQF = [1, 2, 3, 5, 6, 7, 10, 11, 13, 14, 15, 17, 19, 21];
+  function exactSum(y) {
+    if (!isFinite(y) || Math.abs(y) < 1e-12) return null;
+    for (let q = 1; q <= 24; q++) {
+      const t = y * q, tol = 1e-10 * Math.max(1, Math.abs(t));
+      for (let i = 0; i < SQF.length; i++) for (let j = i + 1; j < SQF.length; j++) {
+        const r1 = Math.sqrt(SQF[i]), r2 = Math.sqrt(SQF[j]);
+        for (let p1 = -20; p1 <= 20; p1++) {
+          if (!p1) continue;
+          const p2 = (t - p1 * r1) / r2, k = Math.round(p2);
+          if (k && Math.abs(k) <= 40 && Math.abs(p2 - k) * r2 < tol && gcd(gcd(Math.abs(p1), Math.abs(k)), q) === 1) return { p1, s1: SQF[i], p2: k, s2: SQF[j], q };
+        }
+      }
+    }
+    return null;
+  }
+  const radS = (p, s, first) => {
+    const ap = Math.abs(p), body = (ap === 1 && s > 1 ? "" : String(ap)) + (s > 1 ? "√" + s : "");
+    return first ? (p < 0 ? "−" : "") + body : (p < 0 ? " − " : " + ") + body;
+  };
   // x: giá trị trên hình; k: bậc theo đơn vị a (độ dài 1, diện tích 2, thể tích 3, tỉ số 0)
-  function exact(x, k = 0, a = null) {
+  function exact(x, k = 0, a = null, o = null) {
     const u = a && k ? Math.pow(a, k) : 1;
     const e = exactNum(x / u);
-    if (!e) return null;
+    if (!e) {
+      const z = o && o.sum ? exactSum(x / u) : null;
+      if (!z) return null;
+      // (p1√s1 + p2√s2)/q, nhân đơn vị a ở trước
+      const [t1, t2] = z.s1 === 1 ? [[z.p1, z.s1], [z.p2, z.s2]] : z.p1 > 0 || z.p2 < 0 ? [[z.p1, z.s1], [z.p2, z.s2]] : [[z.p2, z.s2], [z.p1, z.s1]];
+      const body = radS(t1[0], t1[1], true) + radS(t2[0], t2[1], false);
+      const unitS = a && k ? "a" + (SUP[k] || "") : "";
+      return z.q > 1 || unitS ? `${unitS}(${body})${z.q > 1 ? "/" + z.q : ""}` : body;
+    }
     if (e.p === 0) return "0";
     const ap = Math.abs(e.p), unitS = a && k ? "a" + (SUP[k] || "") : "";
     const num = (ap === 1 && (unitS || e.s > 1) ? "" : String(ap)) + unitS + (e.s > 1 ? "√" + e.s : "");
     return (e.p < 0 ? "−" : "") + (num || "1") + (e.q > 1 ? "/" + e.q : "");
+  }
+  // giá trị gần đúng (vị trí đạt cực trị, sai số ~1e-8): chỉ nhận dạng p√s/q đơn giản
+  function exactLoose(x, k = 0, a = null) {
+    const ex = exact(x, k, a);
+    if (ex) return ex;
+    const u = a && k ? Math.pow(a, k) : 1, y = x / u;
+    if (!isFinite(y)) return null;
+    let best = null;
+    for (const s of [1, 2, 3, 5, 6, 7, 10, 11, 13, 14, 15, 17, 19, 21, 22, 23, 26, 29, 30]) {
+      const r = Math.sqrt(s);
+      for (let q = 1; q <= 64; q++) {
+        const p = Math.round((y * q) / r);
+        if (!p || Math.abs(p) > 400) continue;
+        const err = Math.abs((p * r) / q - y);
+        if (err < 2e-7 * Math.max(1, Math.abs(y)) && (!best || q * s < best.q * best.s)) best = { p, q, s };
+      }
+    }
+    if (!best) return null;
+    const g = gcd(Math.abs(best.p), best.q), p = best.p / g, q = best.q / g;
+    return exact((p * Math.sqrt(best.s) / q) * u, k, a);
   }
   // góc: số đo đẹp thì ghi độ, nếu không thì ghi cos (hoặc tan) dạng đúng
   function exactAngle(deg) {
@@ -1427,6 +1661,7 @@ const TM = (() => {
   return {
     GeoError, evalExpr, normParams, build, solve, measure, camera, basis, makeOccluder, splitSegment, autoView,
     exact, exactAngle, fmt, prettyExpr, vec: { add, sub, mul, dot, cross, len, lerp, unit }, DEG, planeName, planeOf, sectionPolygon, joinNames, nameRank, circumsphere,
+    sectionPlane, splitPair, polyArea, optimize, exactLoose,
   };
 })();
 if (typeof module !== "undefined") module.exports = TM;
@@ -2165,9 +2400,16 @@ const TMAux = (() => {
           if (!iN) {
             // giao điểm chưa có tên: chỉ dùng khi nó nằm trên một đường có sẵn của mặt phẳng
             line = realLines.find(([a1, b1]) => onLine(I, g(a1), g(b1)));
+            let virt = false;
+            if (!line) {
+              // hoặc trên đường nối một đỉnh của khối với điểm có tên của mặt phẳng (ví dụ I = AN ∩ A'B), nằm trong đoạn
+              const vs = new Set(M.solid ? M.solid.faces.flatMap((f) => f.names) : []);
+              line = linesOn(pl).find(([a1, b1, vv]) => vv && (vs.has(a1) || vs.has(b1)) && !/^[a-z]/.test(a1 + b1) && onSeg(I, g(a1), g(b1)) && onSeg(I, X, Y));
+              virt = !!line;
+            }
             if (!line || far(I)) continue;
             // giao điểm nằm ngoài cạnh (phải kéo dài ra xa) thì kém gọn hơn
-            extra = 0.4 + (onSeg(I, g(line[0]), g(line[1])) ? 0 : 0.5);
+            extra = 0.4 + (onSeg(I, g(line[0]), g(line[1])) ? 0 : 0.5) + (virt ? 0.9 : 0);
           }
           ratio = len(sub(X, I)) / len(sub(Y, I));
           const rs = frac(ratio);
@@ -2214,7 +2456,9 @@ const TMAux = (() => {
         // chỉ dùng khi cách dựng trực tiếp phải dùng mặt phẳng phụ (B2) hoặc quá dài
         let tail = best;
         while (tail && tail.tr) tail = tail.tr.py;
-        const weak = !best || /^(B2|C)$/.test(tail?.plan?.type) || tail?.plan?.weak || best.score >= 5.5;
+        // điểm cuối có ba cạnh đôi một vuông góc tới mặt phẳng (tứ diện vuông) thì không cần thể tích
+        const triOK = !!(tail && tail.xn && triRect(tail.xn, matNames));
+        const weak = !triOK && (!best || /^(B2|C)$/.test(tail?.plan?.type) || tail?.plan?.weak || best.score >= 5.5);
         const vp = weak ? bestVol(xn, matNames) : null;
         const vs = vp ? 2.6 + vp.score : Infinity;
         if (vp && vs < (best ? best.score : Infinity)) {
@@ -2996,46 +3240,72 @@ const TMAux = (() => {
       grp.steps.push(s); grp.result = `${n1} ∩ ${n2} = ${L.via ? L.via + xN : "Δ"}`;
     }
 
-    // thiết diện: dựng theo phương pháp giao tuyến (kéo dài để tìm giao điểm phụ)
+    // thiết diện, dựng như sách: giao tuyến với từng mặt (nối hai điểm chung, qua điểm chung kẻ đường song song,
+    // dùng mặt chéo, kéo dài tìm giao điểm phụ); mặt phẳng cắt có thể qua 3 điểm, song song hoặc vuông góc với đường, mặt
     function thietDien(it, grp) {
       const S = M.solid;
       if (!S) return;
-      const sig = plane(it.qua);
+      let sig;
+      try { sig = TM.sectionPlane(M, it); } catch { return; }
       const poly = TM.sectionPolygon(M, sig);
       if (poly.length < 3) return;
-      const knownPts = (it.qua || []).map((n) => ({ n, P: g(n) }));
+      const U = TM.vec.unit;
+      const lines2 = (x) => (!Array.isArray(x) ? [] : Array.isArray(x[0]) ? x.filter(Array.isArray) : x.length >= 2 ? [x] : []);
+      const quaN = [...new Set([...(Array.isArray(it.qua) ? it.qua : it.qua ? [it.qua] : []), ...(Array.isArray(it.chua) ? it.chua : [])])].filter((n) => known.has(n));
+      const ssL = lines2(it.song_song), vgL = lines2(it.vuong_goc)[0], ssM = Array.isArray(it.song_song_mat) ? it.song_song_mat : null, vgM = Array.isArray(it.vuong_goc_mat) ? it.vuong_goc_mat : null;
+      const plain3 = quaN.length >= 3 && !ssL.length && !vgL && !ssM && !vgM;
+      const sn = it.ten ? `(${String(it.ten).replace(/^\(|\)$/g, "")})` : plain3 ? trio(...quaN.slice(0, 3)) : "(α)";
+      const knownPts = quaN.map((n) => ({ n, P: g(n) }));
+      // tên đỉnh thiết diện do đề đặt (ví dụ "(P) cắt SB tại H"): là điểm cần dựng, chưa phải điểm đã biết
+      const secNamed = new Set((Array.isArray(it.dinh) ? it.dinh.map((x) => x?.ten) : Object.values(it.dinh || {})).filter(Boolean));
       const addKnown = (P, prefs) => {
         const n = alloc(P, prefs);
         if (!knownPts.some((k) => k.n === n)) knownPts.push({ n, P });
         return n;
       };
+      const isKnown = (P) => knownPts.some((k) => same(k.P, P));
+      const VN = ["N", "P", "Q", "K", "J", "R", "T", "U", "V", "E", "F", "G"];
+      const edgeName = (V) => {
+        for (const [a, b] of S.edges) if (onSeg(V, g(a), g(b))) return same(V, g(a)) ? a : same(V, g(b)) ? b : pair(a, b);
+        return null;
+      };
+      const onSolidEdge = (V) => S.edges.some(([a, b]) => onSeg(V, g(a), g(b)));
       const faces = S.faces.map((f) => {
         const P = f.names.map(g);
         let pl = null;
         for (let i = 0; i + 2 < f.names.length && !pl; i++) { try { pl = plane([f.names[0], f.names[i + 1], f.names[i + 2]]); } catch { pl = null; } }
         return { names: f.names, P, pl, done: false, line: null };
       }).filter((f) => f.pl);
-      const edgeName = (V) => {
-        for (const [a, b] of S.edges) if (onSeg(V, g(a), g(b))) return same(V, g(a)) ? a : same(V, g(b)) ? b : pair(a, b);
-        return null;
+      const fname = (f) => TM.planeName(M, f.names);
+      // tên mặt phẳng phụ: ưu tiên đỉnh của khối, rồi các điểm đang dùng (đầu mút đoạn, phương song song, điểm của đề)
+      const labelPlane = (three, prefer) => {
+        let pl;
+        try { pl = plane(three); } catch { return trio(...three); }
+        const verts = [...new Set(S.faces.flatMap((f) => f.names))].sort(byRank);
+        const cand = [...new Set([...verts, ...prefer, ...three])].filter((n) => known.has(n) && onPl(g(n), pl));
+        for (let i = 0; i < cand.length; i++) for (let j = i + 1; j < cand.length; j++) for (let k2 = j + 1; k2 < cand.length; k2++) {
+          const A = g(cand[i]), B = g(cand[j]), C = g(cand[k2]);
+          if (len(cross(sub(B, A), sub(C, A))) > 1e-6 * R * R) return trio(cand[i], cand[j], cand[k2]);
+        }
+        return trio(...three);
       };
-      const polyKnown = () => poly.every((P) => knownPts.some((k) => same(k.P, P)));
+      const isFacePlane = (pl) => faces.some((f) => len(cross(f.pl.n, pl.n)) < 1e-7 && onPl(f.P[0], pl));
+      const polyKnown = () => poly.every((P) => isKnown(P));
       const joined = new Set();
       const sideKey = (x, y) => [x, y].sort().join("|");
       const sidesDone = () => {
-        let n = 0;
         for (let i = 0; i < poly.length; i++) {
           const a = nameOf(poly[i]), b = nameOf(poly[(i + 1) % poly.length]);
-          if (a && b && joined.has(sideKey(a, b))) n++;
+          if (!a || !b || !joined.has(sideKey(a, b))) return false;
         }
-        return n === poly.length;
+        return true;
       };
       // giao của đường thẳng (A, B) với đa giác lồi của mặt
       const clip = (A, B, f) => {
         const w = sub(B, A), ts = [];
         for (let i = 0; i < f.P.length; i++) {
           const C = f.P[i], D = f.P[(i + 1) % f.P.length], e = sub(D, C), n = cross(w, e);
-          if (len(n) < 1e-12) continue;
+          if (len(n) < 1e-12 * len(w) * len(e)) continue;
           const r = sub(C, A);
           const t = dot(cross(r, e), n) / dot(n, n), s = dot(cross(r, w), n) / dot(n, n);
           if (s > -1e-6 && s < 1 + 1e-6) ts.push(t);
@@ -3045,9 +3315,152 @@ const TMAux = (() => {
         if (Math.abs(t1 - t0) * len(w) < tolP) return null;
         return [add(A, mul(w, t0)), add(A, mul(w, t1))];
       };
-      const fname = (f) => TM.planeName(M, f.names);
-      for (let iter = 0; iter < 24; iter++) {
-        let progress = false;
+      const cutText = (news) => {
+        if (!news.length) return "";
+        if (news.length === 1) return `, cắt ${edgeName(news[0][1]) || "cạnh"} tại ${news[0][0]}`;
+        return `, cắt ${news.map(([, P]) => edgeName(P) || "cạnh").join(", ")} lần lượt tại ${news.map(([n]) => n).join(", ")}`;
+      };
+
+      // ---------- phương song song với mặt cắt ----------
+      const dirs = [];
+      const addDir = (a, b, why, extra = {}) => {
+        if (!known.has(a) || !known.has(b)) return;
+        const v = sub(g(b), g(a));
+        if (len(v) < 1e-9 * R || Math.abs(dot(U(v), sig.n)) > 1e-6) return;
+        if (dirs.some((d) => d.name === pair(a, b))) return;
+        dirs.push({ a, b, v, name: pair(a, b), why, ...extra });
+      };
+      // các đường có tên của hình: cạnh, đoạn đã vẽ, đường chéo đáy
+      const figLines = (() => {
+        const L = [...S.edges, ...namedSegs];
+        const B = S.base;
+        for (let i = 0; i < B.length; i++) for (let j = i + 2; j < B.length; j++) if (!(i === 0 && j === B.length - 1)) L.push([B[i], B[j]]);
+        if (S.top) { const T = S.top; for (let i = 0; i < T.length; i++) for (let j = i + 2; j < T.length; j++) if (!(i === 0 && j === T.length - 1)) L.push([T[i], T[j]]); }
+        // đường chéo của các mặt bên (BC', A'B...) để gọi tên phương song song ngay trong mặt đó
+        for (const f of S.faces) { const F = f.names; if (F.length === 4) { L.push([F[0], F[2]]); L.push([F[1], F[3]]); } }
+        const seen = new Set();
+        return L.filter(([a, b]) => { const k = [a, b].sort().join("|"); if (seen.has(k) || !known.has(a) || !known.has(b)) return false; seen.add(k); return true; });
+      })();
+      // trong mặt f, đường có tên vuông góc với phương v (ví dụ đường qua A vuông góc với AC)
+      const perpInFace = (f, v) => {
+        let best = null;
+        for (const [a, b] of figLines) {
+          if (!onPl(g(a), f.pl) || !onPl(g(b), f.pl)) continue;
+          const w = sub(g(b), g(a));
+          if (Math.abs(dot(U(w), U(v))) > 1e-7) continue;
+          const sc = (S.edges.some(([x, y]) => (x === a && y === b) || (x === b && y === a)) ? 0.5 : 0) + 0.01 * (rank(a) + rank(b));
+          if (!best || sc < best.sc) best = { sc, name: pair(a, b) };
+        }
+        return best && best.name;
+      };
+      // trong mặt f, đường có tên song song với phương v
+      const lineInFaceParallel = (f, v) => {
+        let best = null;
+        for (const [a, b] of figLines) {
+          if (!onPl(g(a), f.pl) || !onPl(g(b), f.pl)) continue;
+          const w = sub(g(b), g(a));
+          if (len(cross(U(w), U(v))) > 1e-6) continue;
+          const sc = (S.edges.some(([x, y]) => (x === a && y === b) || (x === b && y === a)) ? 0 : 0.5) + 0.01 * (rank(a) + rank(b));
+          if (!best || sc < best.sc) best = { sc, name: pair(a, b) };
+        }
+        return best && best.name;
+      };
+      for (const [a, b] of ssL) addDir(a, b, `${sn} ∥ ${pair(a, b)}`);
+      if (ssM && ssM.length >= 3) {
+        for (let i = 0; i < ssM.length; i++) for (let j = i + 1; j < ssM.length; j++) addDir(ssM[i], ssM[j], `${sn} ∥ ${PN(ssM)}`, { ref: true });
+        grp.steps.push(St(`Vì ${sn} ∥ ${PN(ssM)} nên ${sn} cắt mỗi mặt của khối theo giao tuyến song song với giao tuyến của ${PN(ssM)} với mặt đó`));
+      }
+      // mặt phẳng vuông góc với đường thẳng ℓ: chứa mọi đường vuông góc với ℓ
+      if (vgL) {
+        const [p, q] = vgL, l = U(sub(g(q), g(p)));
+        const perps = figLines.filter(([a, b]) => Math.abs(dot(U(sub(g(b), g(a))), l)) < 1e-7);
+        const pick = [];
+        for (const [a, b] of perps.sort((x, y) => rank(x[0]) + rank(x[1]) - rank(y[0]) - rank(y[1]))) {
+          const v = U(sub(g(b), g(a)));
+          if (pick.every(([a2, b2]) => len(cross(U(sub(g(b2), g(a2))), v)) > 1e-6)) pick.push([a, b]);
+          if (pick.length === 2) break;
+        }
+        const why0 = (a, b) => (isVert(a, b) && basePlane && onPl(g(p), basePlane) && onPl(g(q), basePlane) ? ` (vì ${pair(a, b)} ⊥ ${PN(S.base.slice(0, 3))})` : "");
+        if (pick.length === 2 && quaN.length < 3) {
+          grp.steps.push(St(`Ta có ${pick.map(([a, b]) => `${pair(a, b)} ⊥ ${pair(p, q)}${why0(a, b)}`).join(", ")} mà ${sn} ⊥ ${pair(p, q)} nên ${sn} ∥ ${pair(...pick[0])}, ${sn} ∥ ${pair(...pick[1])}`));
+          for (const [a, b] of pick) addDir(a, b, `${sn} ∥ ${pair(a, b)}`);
+        } else {
+          for (const [a, b] of pick) addDir(a, b, `${sn} ∥ ${pair(a, b)}`);
+          // giao điểm H của ℓ với mặt cắt: kẻ XH ⊥ ℓ từ một điểm X của mặt cắt
+          const den = dot(sig.n, sub(g(q), g(p)));
+          if (Math.abs(den) > 1e-9 && quaN.length) {
+            const H = add(g(p), mul(sub(g(q), g(p)), dot(sig.n, sub(sig.o, g(p))) / den));
+            if (!far(H) && !isKnown(H)) {
+              // điểm kẻ: ưu tiên điểm có tên trên đường của mặt cắt mà XH vuông góc với đường đó (như trung điểm M của AB)
+              let X = quaN[0];
+              if (quaN.length >= 2) {
+                const [u0, w0] = quaN, F = footLn(H, g(u0), g(w0)), fn = nameIn(F);
+                if (fn && !same(F, H)) X = fn;
+              }
+              if (same(g(X), H) && quaN[1]) X = quaN[1];
+              const hN = addKnown(H, ["H", "K", "I", "E"]);
+              const newH = isFresh(hN) || secNamed.has(hN);
+              const s = St(`${newH ? "Kẻ" : "Ta có"} ${X}${hN} ⊥ ${pair(p, q)}${newH ? " tại " + hN : ""}` + (quaN.length >= 2 ? `. Vì ${sn} chứa ${pair(quaN[0], quaN[1])} và vuông góc với ${pair(p, q)} nên ${sn} ≡ ${trio(quaN[0], quaN[1], hN)}` : `. Khi đó ${sn} chứa ${X}${hN}`));
+              seg(s, g(X), H); mark(s, "right", H, g(X), same(g(p), H) ? g(q) : g(p)); pt(s, hN, g(p), g(q));
+              grp.steps.push(s);
+            }
+          }
+        }
+      }
+      // mặt phẳng chứa đường PQ và vuông góc với mặt (π): kẻ đường vuông góc từ một điểm của PQ xuống (π)
+      if (vgM && vgM.length >= 3) {
+        let pi = null;
+        try { pi = plane(vgM); } catch { pi = null; }
+        if (pi) {
+          const cands = [...new Set([...quaN, ...[...M.pts.keys()].filter((n) => !/^[a-z]/.test(n) && n.length < 4 && quaN.length >= 2 && onLine(g(n), g(quaN[0]), g(quaN[1])))])];
+          let best = null;
+          // điểm do đề đặt tên cho đỉnh thiết diện chưa dựng được: tạm ẩn khi dựng đường vuông góc
+          const hidden = [...secNamed].filter((n) => M.pts.has(n)).map((n) => [n, M.pts.get(n), known.get(n)]);
+          const order = [...M.pts.keys()], korder = [...known.keys()];
+          hidden.forEach(([n]) => { M.pts.delete(n); known.delete(n); });
+          const restore = () => {
+            if (!hidden.length) return;
+            const mp = new Map(M.pts), kp = new Map(known);
+            hidden.forEach(([n, P, K]) => { mp.set(n, P); if (K) kp.set(n, K); });
+            M.pts.clear(); order.forEach((n) => { if (mp.has(n)) M.pts.set(n, mp.get(n)); }); mp.forEach((v, n) => { if (!M.pts.has(n)) M.pts.set(n, v); });
+            known.clear(); korder.forEach((n) => { if (kp.has(n)) known.set(n, kp.get(n)); }); kp.forEach((v, n) => { if (!known.has(n)) known.set(n, v); });
+          };
+          try {
+            for (const xn of cands) {
+              if (onPl(g(xn), pi)) continue;
+              const pl0 = planDM(xn, pi);
+              if (!pl0 || pl0.type === "zero") continue;
+              const sc = pl0.score + (quaN.includes(xn) ? 0.2 : 0);
+              if (!best || sc < best.sc) best = { sc, xn, pl0 };
+            }
+          } catch { best = null; }
+          if (best) {
+            let segN;
+            try { segN = emitDM(grp, best.xn, pi, PN(vgM), best.pl0); } finally { restore(); }
+            const fN = segN && segN.startsWith(best.xn) ? segN.slice(best.xn.length) : null;
+            if (fN && known.has(fN)) {
+              if (!knownPts.some((k) => k.n === fN)) knownPts.push({ n: fN, P: g(fN) });
+              const others = quaN.filter((n) => n !== best.xn);
+              const lead = others.length ? trio(...[...new Set([...quaN.slice(0, 2), fN])]) : null;
+              grp.steps.push(St(`Mặt phẳng ${sn} chứa ${quaN.length >= 2 ? pair(quaN[0], quaN[1]) : best.xn} và đường ${best.xn}${fN} vuông góc với ${PN(vgM)} nên ${sn} ⊥ ${PN(vgM)}${lead ? `, tức là ${sn} ≡ ${lead}` : ""}`));
+            }
+          } else restore();
+        }
+      }
+      // giao tuyến đã dựng trong một mặt cũng là phương của mặt cắt (dùng cho mặt song song với nó)
+      const addTraceDir = (f, v1, v2) => { if (!dirs.some((d) => d.name === pair(v1, v2))) { const v = sub(g(v2), g(v1)); if (len(v) > tolP) dirs.push({ a: v1, b: v2, v, name: pair(v1, v2), trace: f }); } };
+
+      // ---------- các bước dựng ----------
+      const drawTrace = (s, f, V1, V2, v1, v2, news) => {
+        f.done = true; f.line = { V1, V2, v1, v2 };
+        joined.add(sideKey(v1, v2));
+        seg(s, V1, V2, { sec: true });
+        news.forEach(([n]) => pt(s, n));
+        grp.steps.push(s);
+        addTraceDir(f, v1, v2);
+      };
+      // 1) mặt có hai điểm chung: nối lại
+      const stepJoin = () => {
         for (const f of faces) {
           if (f.done) continue;
           const ks = [];
@@ -3055,33 +3468,136 @@ const TMAux = (() => {
           if (ks.length < 2) continue;
           let a = ks[0], b = ks[1];
           for (const x of ks) for (const y of ks) if (len(sub(x.P, y.P)) > len(sub(a.P, b.P))) { a = x; b = y; }
-          f.done = true; progress = true;
           const cut = clip(a.P, b.P, f);
-          if (!cut) continue;
+          if (!cut) { f.done = true; continue; }
           const [V1, V2] = cut;
           const before = new Set(knownPts.map((k) => k.n));
-          const v1 = addKnown(V1, ["Q", "R", "T", "U", "V"]), v2 = addKnown(V2, ["Q", "R", "T", "U", "V"]);
-          f.line = { V1, V2, v1, v2 };
+          const v1 = addKnown(V1, VN), v2 = addKnown(V2, VN);
           const news = [[v1, V1], [v2, V2]].filter(([n]) => !before.has(n));
-          if (!news.length && joined.has(sideKey(v1, v2))) continue;
-          joined.add(sideKey(v1, v2));
-          let desc;
-          if (!news.length) desc = `Nối ${pair(v1, v2)}`;
-          else desc = `Trong mặt ${fname(f)}, ${a.n}${b.n} cắt ${news.map(([n, P]) => `${edgeName(P) || "cạnh"} tại ${n}`).join(" và ")}`;
+          if (!news.length && joined.has(sideKey(v1, v2))) { f.done = true; f.line = { V1, V2, v1, v2 }; continue; }
+          // giao tuyến là cạnh có sẵn của khối: không cần bước "Nối"
+          if (!news.length && S.edges.some(([x, y]) => onSeg(V1, g(x), g(y)) && onSeg(V2, g(x), g(y)))) {
+            f.done = true; f.line = { V1, V2, v1, v2 }; joined.add(sideKey(v1, v2)); addTraceDir(f, v1, v2);
+            return true;
+          }
+          const desc = !news.length ? `Nối ${pair(v1, v2)}` : `Trong ${fname(f)}, ${pair(a.n, b.n)} cắt ${news.map(([n, P]) => `${edgeName(P) || "cạnh"} tại ${n}`).join(" và ")}`;
           const s = St(desc);
-          seg(s, V1, V2, { sec: true });
           for (const k of [a, b]) {
             if (same(k.P, V1) || same(k.P, V2)) continue;
             const farV = len(sub(k.P, V1)) > len(sub(k.P, V2)) ? V1 : V2;
             seg(s, k.P, farV, { thin: true });
           }
-          news.forEach(([n]) => pt(s, n));
-          grp.steps.push(s);
+          drawTrace(s, f, V1, V2, v1, v2, news);
+          return true;
         }
-        if (faces.every((f) => f.done) || (polyKnown() && sidesDone())) break;
-        if (progress) continue;
-        // tìm điểm phụ: kéo dài một giao tuyến đã có cắt đường chứa cạnh của mặt chưa xét
-        let made = false;
+        return false;
+      };
+      // 2) mặt có một điểm chung và chứa (hoặc song song với) một phương của mặt cắt: qua điểm đó kẻ đường song song
+      const stepParallel = () => {
+        let best = null;
+        for (const f of faces) {
+          if (f.done) continue;
+          const ks = knownPts.filter((k) => onPl(k.P, f.pl));
+          if (!ks.length) continue;
+          for (const d of dirs) {
+            if (Math.abs(dot(U(d.v), f.pl.n)) > 1e-6) continue;
+            const inF = onPl(g(d.a), f.pl) && onPl(g(d.b), f.pl);
+            const alt = inF ? null : lineInFaceParallel(f, d.v);
+            const parFace = d.trace && d.trace !== f && len(cross(d.trace.pl.n, f.pl.n)) < 1e-7;
+            // giao tuyến đã có song song với một đường của mặt này (CD ∥ AB nên CD ∥ (SAB))
+            if (d.trace && (d.trace === f || (!parFace && !alt))) continue;
+            for (const k of ks) {
+              const cut = clip(k.P, add(k.P, d.v), f);
+              let news = 0;
+              if (cut) for (const V of cut) if (!isKnown(V)) news++;
+              const sc = (cut ? 0 : 3) + (news ? 0 : 2) + (inF ? 0 : alt ? 0.3 : parFace ? 0.4 : 0.8) + (d.ref ? 0.05 : 0) + (d.trace ? 0.2 : 0) + (onSolidEdge(k.P) ? 0 : 0.1) + 0.001 * dirs.indexOf(d);
+              if (!best || sc < best.sc) best = { sc, f, d, k, cut, inF, alt, parFace };
+            }
+          }
+        }
+        if (!best || best.sc >= 3) { touchCand = best && best.sc >= 3 ? best : null; return false; }
+        const { f, d, k, cut, inF, alt, parFace } = best;
+        if (!cut) return false;
+        const [V1, V2] = cut;
+        const before = new Set(knownPts.map((x) => x.n));
+        const v1 = addKnown(V1, VN), v2 = addKnown(V2, VN);
+        const news = [[v1, V1], [v2, V2]].filter(([n]) => !before.has(n));
+        let desc;
+        if (parFace) desc = `Vì ${fname(d.trace)} ∥ ${fname(f)} nên trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${d.name}`;
+        else if (d.trace) desc = `Vì ${d.name} ∥ ${alt} nên ${d.name} ∥ ${fname(f)}; trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${alt}`;
+        else if (inF || !alt) desc = `Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${d.name}`;
+        else desc = `Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${alt} (vì ${alt} ∥ ${d.name})`;
+        const s = St(desc + cutText(news));
+        if (!news.length && joined.has(sideKey(v1, v2))) { f.done = true; f.line = { V1, V2, v1, v2 }; return true; }
+        drawTrace(s, f, V1, V2, v1, v2, news);
+        return true;
+      };
+      // đường song song chỉ chạm mặt tại điểm đã biết (mặt này chỉ có một điểm chung): kẻ ra để kéo dài tìm giao điểm
+      let touchCand = null;
+      const stepTouch = () => {
+        stepParallel();
+        if (!touchCand) return false;
+        const { f, d, k, inF, alt } = touchCand;
+        touchCand = null;
+        f.done = true; f.line = { V1: k.P, V2: add(k.P, d.v), v1: k.n, v2: null, touch: true };
+        const nm = inF || !alt ? d.name : alt;
+        const s = St(`Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${nm}` + (!inF && alt ? ` (vì ${alt} ∥ ${d.name})` : ""));
+        seg(s, k.P, add(k.P, mul(U(d.v), 0.35 * R)), { thin: true });
+        grp.steps.push(s);
+        return true;
+      };
+      // 3) điểm chung nằm trên đường chéo: dùng mặt chéo chứa phương song song, ví dụ "Trong (SBD), qua M kẻ đường song song với SD cắt SB tại K"
+      const stepDiagParallel = () => {
+        if (!dirs.length) return false;
+        const named = [...M.pts.keys()].filter((n) => !/^[a-z]/.test(n) && n.length < 4);
+        const verts = [...new Set(S.faces.flatMap((f) => f.names))];
+        const thirds = [...new Set([...verts, ...quaN, ...dirs.flatMap((d) => [d.a, d.b]), ...namedSegs.flat()])].filter((n) => known.has(n) && !/^[a-z]/.test(n));
+        let best = null;
+        for (const k of knownPts) {
+          for (const d of dirs) {
+            if (d.trace) continue;
+            for (let i = 0; i < named.length; i++) for (let j = i + 1; j < named.length; j++) {
+              const u = named[i], w = named[j];
+              if (!onSeg(k.P, g(u), g(w)) || same(g(u), g(w)) || same(g(u), k.P) || same(g(w), k.P)) continue;
+              for (const z of thirds) {
+                if (z === u || z === w || onLine(g(z), g(u), g(w))) continue;
+                let pi;
+                try { pi = plane([u, w, z]); } catch { continue; }
+                if (Math.abs(dot(U(d.v), pi.n)) > 1e-6 || isFacePlane(pi)) continue;
+                // đường cắt: cạnh của khối (cho ngay đỉnh thiết diện) hoặc đoạn nối hai điểm có tên nằm trên một mặt chưa xét (ví dụ SA' ⊂ (SBC))
+                const tgt = S.edges.map(([e1, e2]) => [e1, e2, true]);
+                for (let i2 = 0; i2 < named.length; i2++) for (let j2 = i2 + 1; j2 < named.length; j2++) tgt.push([named[i2], named[j2], false]);
+                for (const [e1, e2, isEdge] of tgt) {
+                  if (!onPl(g(e1), pi) || !onPl(g(e2), pi) || same(g(e1), g(e2))) continue;
+                  const E1 = g(e1), E2 = g(e2), e = sub(E2, E1), n = cross(d.v, e);
+                  if (len(n) < 1e-9 * len(d.v) * len(e)) continue;
+                  const t = dot(cross(sub(E1, k.P), e), n) / dot(n, n), sE = dot(cross(sub(E1, k.P), d.v), n) / dot(n, n);
+                  if (sE < -1e-6 || sE > 1 + 1e-6) continue;
+                  const Y = add(k.P, mul(d.v, t));
+                  if (isKnown(Y) || same(Y, k.P)) continue;
+                  let face = null;
+                  if (isEdge) { if (!poly.some((P) => same(P, Y))) continue; }
+                  else {
+                    face = faces.find((f) => !f.done && onPl(E1, f.pl) && onPl(E2, f.pl));
+                    if (!face || onSolidEdge(Y)) continue;
+                  }
+                  const sc = (isEdge ? 0 : 0.8) + (z === apex ? 0 : 0.5) + (verts.includes(u) && verts.includes(w) ? 0 : 0.3) + (hasSeg(d.a, d.b) || S.edges.some(([x, y]) => (x === d.a && y === d.b) || (x === d.b && y === d.a)) ? 0 : 0.2);
+                  if (!best || sc < best.sc) best = { sc, k, d, u, w, z, e1, e2, Y, isEdge };
+                }
+              }
+            }
+          }
+        }
+        if (!best) return false;
+        const { k, d, u, w, z, e1, e2, Y, isEdge } = best;
+        const yN = addKnown(Y, isEdge ? VN : ["E", "F", "G", "I", "L", "T"]);
+        const s = St(`Trong ${labelPlane([u, w, z], [u, w, d.a, d.b, ...quaN])}, qua ${k.n} kẻ đường thẳng song song với ${d.name}, cắt ${pair(e1, e2)} tại ${yN}`);
+        seg(s, k.P, Y, { thin: true }); pt(s, yN);
+        grp.steps.push(s);
+        return true;
+      };
+      // 4) kéo dài một giao tuyến đã có cắt đường chứa cạnh của mặt chưa xét (tìm giao điểm phụ)
+      const stepExtend = () => {
         const open = faces.filter((f) => !f.done);
         const opts = [];
         for (const f1 of faces) {
@@ -3096,56 +3612,243 @@ const TMAux = (() => {
             if (len(n) < 1e-9 * len(u) * len(v)) continue;
             const t = dot(cross(sub(A, V1), v), n) / dot(n, n);
             const X = add(V1, mul(u, t));
-            if (far(X) || same(X, V1) || same(X, V2) || knownPts.some((k) => same(k.P, X))) continue;
+            if (far(X) || same(X, V1) || same(X, V2) || isKnown(X)) continue;
             const has = knownPts.some((k) => onPl(k.P, f2.pl));
             opts.push({ X, a, b, A, B, V1, V2, v1, v2, f1, sc: (has ? 0 : 1) + len(sub(X, M.center)) / R * 0.1 });
           }
         }
         opts.sort((x, y) => x.sc - y.sc);
-        if (opts.length) {
-          const o = opts[0];
-          const xN = addKnown(o.X, ["E", "F", "G", "I", "J", "K"]);
-          const s = St(`Trong mặt ${fname(o.f1)}, kéo dài ${pair(o.v1, o.v2)} cắt ${pair(o.a, o.b)} tại ${xN}`);
-          extend(s, o.X, o.V1, o.V2); extend(s, o.X, o.A, o.B); pt(s, xN);
-          grp.steps.push(s);
-          made = true;
-        }
-        if (!made) {
-          // không kéo dài được (các đường song song): qua điểm đã biết kẻ đường song song
-          for (const f of open) {
-            const k = knownPts.find((x) => onPl(x.P, f.pl));
-            if (!k) continue;
-            const dv = cross(sig.n, f.pl.n);
-            if (len(dv) < 1e-9) continue;
-            const cut = clip(k.P, add(k.P, dv), f);
-            if (!cut) { f.done = true; continue; }
-            const [V1, V2] = cut;
-            const ref = namedSegs.map(([p2, q2]) => [p2, q2]).concat(S.edges)
-              .find(([p2, q2]) => len(cross(sub(g(q2), g(p2)), dv)) < 1e-6 * len(sub(g(q2), g(p2))) * len(dv));
-            const before = new Set(knownPts.map((x) => x.n));
-            const v1 = addKnown(V1, ["Q", "R", "T", "U", "V"]), v2 = addKnown(V2, ["Q", "R", "T", "U", "V"]);
-            f.done = true; f.line = { V1, V2, v1, v2 };
-            joined.add(sideKey(v1, v2));
-            const news = [[v1, V1], [v2, V2]].filter(([n]) => !before.has(n));
-            const st = St(`Trong mặt ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${ref ? pair(ref[0], ref[1]) : "giao tuyến"}` +
-              (news.length ? `, cắt ${news.map(([n, P]) => `${edgeName(P) || "cạnh"} tại ${n}`).join(" và ")}` : ""));
-            news.forEach(([n]) => pt(st, n));
-            seg(st, V1, V2, { sec: true });
-            grp.steps.push(st);
-            made = true;
-            break;
+        if (!opts.length) return false;
+        const o = opts[0];
+        const xN = addKnown(o.X, ["E", "F", "G", "I", "J", "K", "L", "T"]);
+        const s = St(o.v2 ? `Trong ${fname(o.f1)}, kéo dài ${pair(o.v1, o.v2)} cắt ${pair(o.a, o.b)} tại ${xN}`
+          : `Trong ${fname(o.f1)}, đường thẳng qua ${o.v1} vừa kẻ cắt ${pair(o.a, o.b)} tại ${xN}`);
+        extend(s, o.X, o.V1, o.V2); extend(s, o.X, o.A, o.B); if (!o.v2) seg(s, o.V1, o.X, { thin: true }); pt(s, xN);
+        grp.steps.push(s);
+        return true;
+      };
+      // 5) hình chóp: dùng hai mặt chéo (SAC), (SBD) cắt nhau theo SO
+      const stepDiagCross = () => {
+        if (S.kind !== "chop" || S.base.length < 4) return false;
+        const Bs = S.base, nB = Bs.length, Sx = S.apex, SP = g(Sx);
+        const diags = [];
+        for (let i = 0; i < nB; i++) for (let j = i + 2; j < nB; j++) if (!(i === 0 && j === nB - 1)) diags.push([Bs[i], Bs[j]]);
+        for (const d1 of diags) for (const d2 of diags) {
+          if (d1 === d2) continue;
+          const A1 = g(d1[0]), C1 = g(d1[1]), A2 = g(d2[0]), C2 = g(d2[1]);
+          const u = sub(C1, A1), v = sub(C2, A2), nn = cross(u, v);
+          if (len(nn) < 1e-9 * len(u) * len(v)) continue;
+          const t = dot(cross(sub(A2, A1), v), nn) / dot(nn, nn);
+          if (t < 1e-6 || t > 1 - 1e-6) continue;
+          const O = add(A1, mul(u, t));
+          let p1, p2;
+          try { p1 = plane([Sx, d2[0], d2[1]]); p2 = plane([Sx, d1[0], d1[1]]); } catch { continue; }
+          const k1 = knownPts.filter((k) => onPl(k.P, p1)), k2 = knownPts.filter((k) => onPl(k.P, p2));
+          const uniq = (ks) => ks.filter((k, i) => ks.findIndex((x) => same(x.P, k.P)) === i);
+          const K1 = uniq(k1), K2 = uniq(k2);
+          const dPar = K2.length === 0 ? dirs.find((d) => !d.trace && Math.abs(dot(U(d.v), p2.n)) < 1e-6) : null;
+          if (K1.length < 2 || (K2.length !== 1 && !dPar)) continue;
+          let a = K1[0], b = K1[1];
+          for (const x of K1) for (const y of K1) if (len(sub(x.P, y.P)) > len(sub(a.P, b.P))) { a = x; b = y; }
+          const w = sub(b.P, a.P), so = sub(O, SP), n2 = cross(w, so);
+          if (len(n2) < 1e-9 * len(w) * len(so)) continue;
+          const tF = dot(cross(sub(SP, a.P), so), n2) / dot(n2, n2);
+          const F = add(a.P, mul(w, tF));
+          if (far(F)) continue;
+          if (dPar) {
+            // trong mặt chéo còn lại, qua giao điểm F kẻ đường song song với phương của mặt cắt
+            const hits = [];
+            for (const e of [[Sx, d1[0]], [Sx, d1[1]]]) {
+              const E1 = g(e[0]), E2 = g(e[1]), ev = sub(E2, E1), n3 = cross(dPar.v, ev);
+              if (len(n3) < 1e-9 * len(dPar.v) * len(ev)) continue;
+              const s3 = dot(cross(sub(E1, F), dPar.v), n3) / dot(n3, n3);
+              if (s3 < -1e-6 || s3 > 1 + 1e-6) continue;
+              const Y = add(E1, mul(ev, s3));
+              if (!isKnown(Y) && poly.some((P) => same(P, Y))) hits.push([e, Y]);
+            }
+            if (!hits.length) continue;
+            const oN = alloc(O, ["O", "I"]);
+            if (isFresh(oN) && grpFresh.has(oN)) {
+              const s0 = St(`Gọi ${oN} là giao điểm của ${pair(...d1)} và ${pair(...d2)}`);
+              seg(s0, A1, C1, { thin: true }); seg(s0, A2, C2, { thin: true }); pt(s0, oN);
+              grp.steps.push(s0);
+            }
+            const fN = alloc(F, ["I", "F", "J", "E", "G"]);
+            const s1 = St(`Trong ${trio(Sx, d2[0], d2[1])}, gọi ${fN} là giao điểm của ${pair(a.n, b.n)} và ${pair(Sx, oN)}`);
+            seg(s1, SP, O, { thin: true }); seg(s1, a.P, b.P, { thin: true }); extend(s1, F, a.P, b.P); pt(s1, fN);
+            grp.steps.push(s1);
+            const ys = hits.map(([e, Y]) => [addKnown(Y, VN), Y, e]);
+            const s2 = St(`Trong ${trio(Sx, d1[0], d1[1])}, qua ${fN} kẻ đường thẳng song song với ${dPar.name}, cắt ${ys.map(([, , e]) => pair(e[0], e[1])).join(", ")}${ys.length > 1 ? " lần lượt" : ""} tại ${ys.map(([n]) => n).join(", ")}`);
+            if (ys.length > 1) seg(s2, ys[0][1], ys[1][1], { thin: true }); else seg(s2, F, ys[0][1], { thin: true });
+            ys.forEach(([n]) => pt(s2, n));
+            grp.steps.push(s2);
+            if (!knownPts.some((k) => k.n === fN)) knownPts.push({ n: fN, P: F });
+            return true;
+          }
+          const Z = K2[0];
+          for (const e of [[Sx, d1[0]], [Sx, d1[1]]]) {
+            const E1 = g(e[0]), E2 = g(e[1]), ev = sub(E2, E1), zf = sub(F, Z.P), n3 = cross(zf, ev);
+            if (len(n3) < 1e-9 * len(zf) * len(ev)) continue;
+            const s3 = dot(cross(sub(E1, Z.P), zf), n3) / dot(n3, n3);
+            if (s3 < -1e-6 || s3 > 1 + 1e-6) continue;
+            const Y = add(E1, mul(ev, s3));
+            if (isKnown(Y) || !poly.some((P) => same(P, Y))) continue;
+            const oN = alloc(O, ["O", "I"]);
+            if (isFresh(oN) && grpFresh.has(oN)) {
+              const s0 = St(`Gọi ${oN} là giao điểm của ${pair(...d1)} và ${pair(...d2)}`);
+              seg(s0, A1, C1, { thin: true }); seg(s0, A2, C2, { thin: true }); pt(s0, oN);
+              grp.steps.push(s0);
+            }
+            const fN = alloc(F, ["F", "I", "J", "E", "G"]);
+            const s1 = St(`Trong ${trio(Sx, d2[0], d2[1])}, gọi ${fN} là giao điểm của ${pair(a.n, b.n)} và ${pair(Sx, oN)}`);
+            seg(s1, SP, O, { thin: true }); seg(s1, a.P, b.P, { thin: true }); extend(s1, F, a.P, b.P); pt(s1, fN);
+            grp.steps.push(s1);
+            const yN = addKnown(Y, VN);
+            const s2 = St(`Trong ${trio(Sx, d1[0], d1[1])}, ${pair(Z.n, fN)} cắt ${pair(e[0], e[1])} tại ${yN}`);
+            seg(s2, Z.P, Y, { thin: true }); pt(s2, yN);
+            grp.steps.push(s2);
+            if (!knownPts.some((k) => k.n === fN)) knownPts.push({ n: fN, P: F });
+            return true;
           }
         }
-        if (!made) break;
+        return false;
+      };
+      // 6) chiếu hai điểm đã biết lên mặt đáy (lăng trụ: theo phương cạnh bên; chóp: từ đỉnh): XY cắt X'Y' tại một điểm của đáy
+      const stepProject = () => {
+        let bp;
+        try { bp = plane(S.base.slice(0, 3)); } catch { return false; }
+        const baseF = faces.find((f) => S.base.every((n) => f.names.includes(n)));
+        if (!baseF || baseF.done) return false;
+        const lat = S.kind === "chop" ? null : sub(g(S.top[0]), g(S.base[0]));
+        const proj = (X) => {
+          if (onPl(X, bp)) return X;
+          if (lat) { const den = dot(lat, bp.n); return Math.abs(den) < 1e-12 ? null : sub(X, mul(lat, sd(X, bp) / den)); }
+          const Sp = g(apex), v = sub(X, Sp), den = dot(v, bp.n);
+          return Math.abs(den) < 1e-12 ? null : add(Sp, mul(v, -sd(Sp, bp) / den));
+        };
+        const baseKnown = knownPts.filter((k) => onPl(k.P, bp));
+        let best = null;
+        for (let i = 0; i < knownPts.length; i++) for (let j = i + 1; j < knownPts.length; j++) {
+          const X = knownPts[i], Y = knownPts[j];
+          if (onPl(X.P, bp) && onPl(Y.P, bp)) continue;
+          if (faces.some((f) => onPl(X.P, f.pl) && onPl(Y.P, f.pl))) continue;
+          const X1 = proj(X.P), Y1 = proj(Y.P);
+          if (!X1 || !Y1 || same(X1, Y1) || far(X1) || far(Y1)) continue;
+          const u = sub(Y.P, X.P), v = sub(Y1, X1), n = cross(u, v);
+          if (len(n) < 1e-9 * len(u) * len(v)) continue;
+          const t = dot(cross(sub(X1, X.P), v), n) / dot(n, n);
+          const Z = add(X.P, mul(u, t));
+          if (far(Z) || isKnown(Z)) continue;
+          const useful = baseKnown.some((k) => !same(k.P, Z)) || onSolidEdge(Z);
+          if (!useful) continue;
+          const sc = (nameIn(X1) ? 0 : 1) + (nameIn(Y1) ? 0 : 1) + len(sub(Z, M.center)) / R * 0.1;
+          if (!best || sc < best.sc) best = { sc, X, Y, X1, Y1, Z };
+        }
+        if (!best) return false;
+        const { X, Y, X1, Y1, Z } = best;
+        const bn = PN(S.base.slice(0, 3));
+        const nameProj = (K, K1) => {
+          const ex = nameIn(K1);
+          if (ex) return ex;
+          const nn = alloc(K1, [K.n + "'", K.n + "₁", "H", "K"]);
+          const s0 = St(lat ? `Gọi ${nn} là hình chiếu của ${K.n} lên ${bn} theo phương ${pair(S.base[0], S.top[0])}` : `Gọi ${nn} là giao điểm của ${pair(apex, K.n)} và ${bn}`);
+          seg(s0, K.P, K1, { thin: true }); pt(s0, nn);
+          grp.steps.push(s0);
+          return nn;
+        };
+        const x1 = nameProj(X, X1), y1 = nameProj(Y, Y1);
+        const zN = addKnown(Z, ["E", "F", "G", "I", "J", "T"]);
+        const s = St(`Trong ${trio(X.n, Y.n, x1 === X.n ? y1 : x1)}, ${pair(X.n, Y.n)} cắt ${pair(x1, y1)} tại ${zN}`);
+        seg(s, X1, Y1, { thin: true }); extend(s, Z, X.P, Y.P); extend(s, Z, X1, Y1); seg(s, X.P, Y.P, { thin: true }); pt(s, zN);
+        grp.steps.push(s);
+        return true;
+      };
+      // 7) không còn cách nào: qua điểm đã biết kẻ đường thẳng song song với giao tuyến
+      const stepFallback = () => {
+        for (const f of faces.filter((x) => !x.done)) {
+          const k = knownPts.find((x) => onPl(x.P, f.pl));
+          if (!k) continue;
+          const dv = cross(sig.n, f.pl.n);
+          if (len(dv) < 1e-9) continue;
+          const cut = clip(k.P, add(k.P, dv), f);
+          if (!cut) {
+            // mặt cắt chỉ chạm mặt này tại một điểm: dựng đường giao tuyến (nằm ngoài mặt) để kéo dài tìm giao điểm
+            f.done = true; f.line = { V1: k.P, V2: add(k.P, dv), v1: k.n, v2: null, touch: true };
+            const ref = lineInFaceParallel(f, dv), pref = ref ? null : perpInFace(f, dv);
+            if (ref || pref) { const s = St(`Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng ${ref ? "song song với " + ref : "vuông góc với " + pref}`); grp.steps.push(s); f.line.desc = true; }
+            return true;
+          }
+          const [V1, V2] = cut;
+          const ref = lineInFaceParallel(f, dv) || (figLines.find(([p2, q2]) => len(cross(U(sub(g(q2), g(p2))), U(dv))) < 1e-6) || []).join("");
+          const before = new Set(knownPts.map((x) => x.n));
+          const v1 = addKnown(V1, VN), v2 = addKnown(V2, VN);
+          const news = [[v1, V1], [v2, V2]].filter(([n]) => !before.has(n));
+          const pref = ref ? null : perpInFace(f, dv);
+          const s = St(`Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng ${ref ? "song song với " + ref : pref ? "vuông góc với " + pref : "song song với giao tuyến"}` + cutText(news));
+          drawTrace(s, f, V1, V2, v1, v2, news);
+          return true;
+        }
+        return false;
+      };
+      for (let iter = 0; iter < 40; iter++) {
+        if (polyKnown() && sidesDone()) break;
+        if (faces.every((f) => f.done)) break;
+        if (stepJoin() || stepParallel() || stepDiagParallel() || stepExtend() || stepDiagCross() || stepProject() || stepTouch() || stepFallback()) continue;
+        break;
       }
-      let names = poly.map((P) => alloc(P, ["Q", "R", "T", "U", "V"]));
-      const i0 = Math.max(0, names.indexOf((it.qua || [])[0]));
+      // tên các đỉnh của thiết diện: bắt đầu từ đỉnh tìm được đầu tiên, đi về phía đỉnh tìm được sớm hơn (như NPQKJ trong sách)
+      let names = poly.map((P) => alloc(P, VN));
+      const ord = (n) => { const i = knownPts.findIndex((k) => k.n === n); return i < 0 ? 1e9 : i; };
+      let i0 = 0;
+      names.forEach((n, i) => { if (ord(n) < ord(names[i0])) i0 = i; });
       names = [...names.slice(i0), ...names.slice(0, i0)];
-      const kinds = { 3: "tam giác", 4: "tứ giác", 5: "ngũ giác", 6: "lục giác" };
-      const s = St(`Thiết diện là ${kinds[poly.length] || "đa giác"} ${names.join("")}`);
+      if (names.length > 2 && ord(names[names.length - 1]) < ord(names[1])) names = [names[0], ...names.slice(1).reverse()];
+      grp.short = `Thiết diện ${sn}`; grp.title = `Thiết diện cắt bởi ${sn}`;
+      const kind = shapeOf(names);
+      const s = St(`Thiết diện là ${kind}`);
       names.forEach((n) => pt(s, n));
       grp.steps.push(s);
-      grp.result = `Thiết diện là ${kinds[poly.length] || "đa giác"} ${names.join("")}`;
+      grp.result = `Thiết diện là ${kind}`;
+      // tính nhanh: diện tích, chu vi của thiết diện
+      const area = TM.polyArea(poly);
+      let per = 0;
+      for (let i = 0; i < poly.length; i++) per += len(sub(poly[(i + 1) % poly.length], poly[i]));
+      const eqS = (v, k) => { const t = exS2(v, k); return /^≈/.test(t) ? t : "= " + t; };
+      grp.calc = [`Diện tích thiết diện: S(${names.join("")}) ${eqS(area, 2)}`, `Chu vi thiết diện ${eqS(per, 1)}`];
+      grp.secNames = names;
+    }
+    // tên hình của đa giác thiết diện (hình thang, hình bình hành, tam giác đều...)
+    function shapeOf(names) {
+      const P = names.map(g), n = P.length;
+      const side = (i) => sub(P[(i + 1) % n], P[i]);
+      const L = (i) => len(side(i));
+      const par = (i, j) => len(cross(side(i), side(j))) < 1e-6 * L(i) * L(j);
+      const right = (i) => Math.abs(dot(side((i + n - 1) % n), side(i))) < 1e-6 * L((i + n - 1) % n) * L(i);
+      const eq = (x, y) => Math.abs(x - y) < 1e-6 * Math.max(x, y);
+      const nm = names.join("");
+      const sideN = (i) => pair(names[i], names[(i + 1) % n]);
+      if (n === 3) {
+        if (eq(L(0), L(1)) && eq(L(1), L(2))) return `tam giác đều ${nm}`;
+        for (let i = 0; i < 3; i++) if (right(i)) return `tam giác ${nm} vuông tại ${names[i]}`;
+        for (let i = 0; i < 3; i++) if (eq(L((i + 2) % 3), L(i))) return `tam giác ${nm} cân tại ${names[i]}`;
+        return `tam giác ${nm}`;
+      }
+      if (n === 4) {
+        const p02 = par(0, 2), p13 = par(1, 3);
+        if (p02 && p13) {
+          const r = right(1), rh = eq(L(0), L(1));
+          return r && rh ? `hình vuông ${nm}` : r ? `hình chữ nhật ${nm}` : rh ? `hình thoi ${nm}` : `hình bình hành ${nm}`;
+        }
+        if (p02 || p13) {
+          const [b1, b2, l1, l2] = p02 ? [0, 2, 1, 3] : [1, 3, 0, 2];
+          const tag = eq(L(l1), L(l2)) ? " cân" : [0, 1, 2, 3].some((i) => right(i)) ? " vuông" : "";
+          return `hình thang${tag} ${nm} (${sideN(b1)} ∥ ${sideN(b2)})`;
+        }
+        return `tứ giác ${nm}`;
+      }
+      if (n === 6 && [0, 1, 2, 3, 4].every((i) => eq(L(i), L(i + 1))) && [0, 1, 2].every((i) => par(i, i + 3))) return `lục giác đều ${nm}`;
+      const kinds = { 5: "ngũ giác", 6: "lục giác" };
+      return `${kinds[n] || "đa giác"} ${nm}`;
     }
 
     // ---------- gom nhóm theo câu hỏi ----------
@@ -3162,7 +3865,10 @@ const TMAux = (() => {
         case "mat_cau": return "Mặt cầu ngoại tiếp";
         case "giao_tuyen": return `${PN(c.mat1)} ∩ ${PN(c.mat2)}`;
         case "do_dai": return J(c.doan);
-        case "dien_tich": return `Diện tích ${J(c.cua)}`;
+        case "dien_tich": return c.thiet_dien != null && c.thiet_dien !== false ? "Diện tích thiết diện" : `Diện tích ${J(c.cua)}`;
+        case "chu_vi": return c.thiet_dien != null && c.thiet_dien !== false ? "Chu vi thiết diện" : `Chu vi ${J(c.cua)}`;
+        case "ti_so": return `${J(c.tu)}/${J(c.mau)}`;
+        case "cuc_tri": return `${c.tim === "min" ? "Min" : "Max"} ${c.cua ? short(c.cua) : ""}`.trim();
         case "giao_diem": return `${J(c.duong)} ∩ ${PN(c.mat)}`;
         case "vuong_goc": case "song_song": {
           const sy = c.loai === "vuong_goc" ? " ⊥ " : " ∥ ";
@@ -3175,6 +3881,15 @@ const TMAux = (() => {
     const aU = M.pv && Number(M.pv.a) > 0 ? Number(M.pv.a) : null;
     const SUPK = ["", "", "²", "³"];
     const exS = (v, k = 1) => TM.exact(v, k, aU) || "≈ " + TM.fmt(aU && k ? v / aU ** k : v) + (aU && k ? "a" + SUPK[k] : "");
+    const exS2 = (v, k = 1) => TM.exact(v, k, aU, { sum: true }) || exS(v, k);
+    const KDEG = { length: 1, area: 2, volume: 3 };
+    const exM = (m) => (m.kind === "angle" ? (TM.exactAngle(m.v) || TM.fmt(m.v, 2) + "°") : exS2(m.v, KDEG[m.kind] ?? 0));
+    // giá trị của biến trong bài cực trị: độ dài theo a, hoặc tỉ số
+    const varText = (c, x) => {
+      const ratio = c.kieu_bien ? c.kieu_bien === "ti_so" : !/a/.test(String(c.den ?? "")) && !(aU && Math.abs(x) > 1.0001);
+      const e = ratio ? TM.exactLoose(x) : TM.exactLoose(x, 1, aU);
+      return e ? "= " + e : "≈ " + (ratio || !aU ? TM.fmt(x) : TM.fmt(x / aU) + "a");
+    };
     const splitName = (str) => {
       for (let i = 1; i < str.length; i++) { const a = str.slice(0, i), b = str.slice(i); if (known.has(a) && known.has(b)) return [a, b]; }
       return null;
@@ -3198,6 +3913,23 @@ const TMAux = (() => {
       }
       return [L1(xn, fn)];
     }
+    // tứ diện vuông: từ X có ba đường đôi một vuông góc tới ba điểm của mặt phẳng
+    function triRect(xn, matNames) {
+      let pl;
+      try { pl = plane(matNames); } catch { return null; }
+      const X = g(xn);
+      if (onPl(X, pl)) return null;
+      const ns = [...new Set([...(matNames || []), ...namedPts()])].filter((n) => n !== xn && known.has(n) && onPl(g(n), pl));
+      const perp = (a, b) => Math.abs(dot(sub(g(a), X), sub(g(b), X))) < 1e-7 * dl(a, xn) * dl(b, xn);
+      for (let i = 0; i < ns.length; i++) for (let j = i + 1; j < ns.length; j++) for (let k = j + 1; k < ns.length; k++) {
+        const [u, v, w] = [ns[i], ns[j], ns[k]];
+        if (!perp(u, v) || !perp(v, w) || !perp(u, w)) continue;
+        const alongEdge = (y) => !!M.solid?.edges.some(([e1, e2]) => (e1 === xn || e2 === xn) && onSeg(g(y), g(e1), g(e2)));
+        if (![u, v, w].every((y) => isEdgeOrSeg(xn, y) || alongEdge(y) || M.solid?.faces.some((f) => f.names.includes(xn) && f.names.includes(y)))) continue;
+        return [xn, u, v, w];
+      }
+      return null;
+    }
     function calcOf(grp) {
       const c = grp.c, out = [];
       if (!c) return out;
@@ -3216,10 +3948,27 @@ const TMAux = (() => {
         if (m) out.push(`Đáp số: ${m.label.replace(/^Khoảng cách/, "khoảng cách")} = 3V/S = ${exS(m.v)}`);
         return out;
       }
+      if (c.loai === "cuc_tri" && m) {
+        const pv = M.pv || {};
+        let lo = null, hi = null;
+        try { lo = c.tu != null ? TM.evalExpr(c.tu, pv) : null; hi = c.den != null ? TM.evalExpr(c.den, pv) : null; } catch { lo = hi = null; }
+        const vt = (x) => varText(c, x).replace(/^= /, "");
+        if (lo != null && hi != null) out.push(`Cho ${m.bien} chạy trong [${vt(lo)}; ${vt(hi)}] và khảo sát ${m.label.replace(/^Giá trị (lớn|nhỏ) nhất của /, "")}`);
+        out.push(`Đáp số: giá trị ${m.opt === "min" ? "nhỏ" : "lớn"} nhất bằng ${exM(m)}, đạt khi ${m.bien} ${varText(c, m.at)}`);
+        return out;
+      }
+      if (c.loai === "ti_so" && m) { out.push(`Đáp số: ${m.label.replace(/^Tỉ số /, "")} = ${TM.exact(m.v) || TM.fmt(m.v)}`); return out; }
+      if ((c.loai === "chu_vi" || c.loai === "dien_tich") && m) { out.push(`Đáp số: ${m.label.charAt(0).toLowerCase() + m.label.slice(1)} = ${exS2(m.v, c.loai === "chu_vi" ? 1 : 2)}`); return out; }
       if (/^khoang_cach/.test(c.loai)) {
         const mt = /=\s*(?:(\d+(?:\/\d+)?)·)?([A-Z][A-Za-z'₁₂]*)\s*$/.exec(grp.result || "");
         const sp = mt && splitName(mt[2]);
-        if (sp) {
+        const tri = sp && c.loai === "khoang_cach_diem_mat" ? triRect(sp[0], c.mat) : null;
+        if (tri) {
+          const [x, u, v, w] = tri;
+          out.push(`Tứ diện ${x}${u}${v}${w} có ${pair(x, u)}, ${pair(x, v)}, ${pair(x, w)} đôi một vuông góc nên 1/h² = 1/${pair(x, u)}² + 1/${pair(x, v)}² + 1/${pair(x, w)}²`);
+          out.push(`${L1(x, u)}, ${L1(x, v)}, ${L1(x, w)} ⇒ h = d(${x}, ${PN(c.mat)}) = ${exS(Math.abs(sd(g(x), plane(c.mat))))}`);
+          if (mt[1]) out.push(`d = ${mt[1]}·h = ${exS(eval0(mt[1]) * Math.abs(sd(g(x), plane(c.mat))))}`);
+        } else if (sp) {
           // chân đường vuông góc là điểm thứ hai (XH, HK...) – thử cả hai chiều
           let lines = altitudeLines(sp[0], sp[1]);
           if (lines.length === 1) { const l2 = altitudeLines(sp[1], sp[0]); if (l2.length > 1) lines = l2; }
@@ -3305,22 +4054,49 @@ const TMAux = (() => {
         const s = St(`Đoạn ${a}${b}`); seg(s, g(a), g(b), { emph: true }); grp.steps.push(s); grp.result = `Độ dài ${a}${b}`;
       },
       dien_tich: (c) => (grp) => {
+        if (c.thiet_dien != null && c.thiet_dien !== false) return; // đã có trong phần thiết diện
         const s = St(`Đa giác ${TM.joinNames(c.cua)}`); s.polys.push({ pts: (c.cua || []).map(g) }); grp.steps.push(s); grp.result = `Diện tích ${TM.joinNames(c.cua)}`;
+      },
+      chu_vi: (c) => (grp) => {
+        if (c.thiet_dien != null && c.thiet_dien !== false) return;
+        const ps = (c.cua || []).map(g), s = St(`Đa giác ${TM.joinNames(c.cua)}`);
+        for (let i = 0; i < ps.length; i++) seg(s, ps[i], ps[(i + 1) % ps.length], { emph: true });
+        grp.steps.push(s); grp.result = `Chu vi ${TM.joinNames(c.cua)}`;
+      },
+      ti_so: (c) => (grp) => {
+        const [a, b] = c.tu || [], [p, q] = c.mau || [];
+        const s = St(`Tỉ số ${a}${b}/${p}${q}`);
+        seg(s, g(a), g(b), { emph: true }); seg(s, g(p), g(q), { thin: true });
+        grp.steps.push(s);
+        const m = TM.measure(c, M);
+        grp.result = `${a}${b}/${p}${q} = ${TM.exact(m.v) || TM.fmt(m.v)}`;
+      },
+      cuc_tri: (c) => (grp) => {
+        const m = TM.measure(c, M);
+        const tag = m.opt === "min" ? "nhỏ nhất" : "lớn nhất";
+        grp.result = `Giá trị ${tag} bằng ${exM(m)} khi ${m.bien} ${varText(c, m.at)}` + (m.edge ? " (đầu mút của khoảng)" : "");
+        grp.opt = { bien: m.bien, at: m.at };
       },
     };
     const ai = aiGroups();
-    (Array.isArray(spec?.so_do) ? spec.so_do : []).forEach((c, i) => {
-      if (c && handlers[c.loai] && !aiReplace.has(i)) run(c, handlers[c.loai](c));
-    });
-    out.groups.push(...ai);
+    // thiết diện dựng trước (các câu diện tích, chu vi, cực trị của thiết diện cần nó), đặt ngay trước câu hỏi đầu tiên dùng tới nó
+    const secGroups = [];
     (Array.isArray(spec?.dung) ? spec.dung : []).forEach((it) => {
       if (it && it.loai === "thiet_dien") {
         grpFresh = new Set();
-        const grp = { key: "thiet_dien", short: `Thiết diện ${PN(it.qua || [])}`, title: `Thiết diện cắt bởi ${PN(it.qua || [])}`, steps: [], result: "", c: it };
+        const qn = Array.isArray(it.qua) ? it.qua : [];
+        const grp = { key: "thiet_dien", short: `Thiết diện ${PN(qn)}`, title: `Thiết diện cắt bởi ${PN(qn)}`, steps: [], result: "", c: it };
         try { thietDien(it, grp); } catch { grp.steps = []; grp.err = "Chưa tự dựng được cách tìm thiết diện"; }
-        out.groups.push(grp);
+        secGroups.push(grp);
       }
     });
+    const usesSec = (c) => !!c && ((c.thiet_dien != null && c.thiet_dien !== false) || usesSec(c.cua && typeof c.cua === "object" && !Array.isArray(c.cua) ? c.cua : null));
+    (Array.isArray(spec?.so_do) ? spec.so_do : []).forEach((c, i) => {
+      if (c && usesSec(c) && secGroups.length) out.groups.push(...secGroups.splice(0));
+      if (c && handlers[c.loai] && !aiReplace.has(i)) run(c, handlers[c.loai](c));
+    });
+    out.groups.push(...ai);
+    out.groups.push(...secGroups);
     for (const c of Array.isArray(spec?.dieu_kien) ? spec.dieu_kien : []) {
       if (c && /^(goc_|khoang_cach)/.test(c.loai) && handlers[c.loai]) run(c, handlers[c.loai](c), true);
     }
@@ -3424,6 +4200,8 @@ const SAMPLES = [
   {"ten_mau": "Giao tuyến và giao điểm", "de_bai": "Cho hình chóp S.ABCD có đáy là hình bình hành, M là trung điểm SC.", "tham_so": {"a": {"gia_tri": 5}, "h": {"gia_tri": 5}}, "dung": [{"loai": "day", "dinh": ["A", "B", "C", "D"], "kieu": "hinh_binh_hanh", "ab": "a", "ad": "0.8*a", "goc": 65}, {"loai": "giao_hai_duong", "ten": "O", "d1": ["A", "C"], "d2": ["B", "D"]}, {"loai": "vuong_goc_mat", "ten": "S", "tai": "O", "mat": ["A", "B", "C"], "do_dai": "h"}, {"loai": "chop", "dinh": "S", "day": ["A", "B", "C", "D"]}, {"loai": "trung_diem", "ten": "M", "cua": ["S", "C"]}, {"loai": "doan", "cua": ["A", "M"]}], "so_do": [{"loai": "giao_tuyen", "mat1": ["S", "A", "C"], "mat2": ["S", "B", "D"]}, {"loai": "giao_tuyen", "mat1": ["S", "A", "B"], "mat2": ["S", "C", "D"]}, {"loai": "giao_diem", "duong": ["A", "M"], "mat": ["S", "B", "D"]}], "yeu_cau": ["Tìm giao tuyến của (SAC) và (SBD).", "Tìm giao tuyến của (SAB) và (SCD).", "Tìm giao điểm của AM và (SBD)."], "gia_dinh": ["Chọn a = 5 đơn vị để vẽ."]},
   {"ten_mau": "Chứng minh vuông góc", "de_bai": "Cho hình chóp S.ABCD có đáy là hình vuông, SA ⊥ (ABCD).", "tham_so": {"a": {"gia_tri": 4}}, "dung": [{"loai": "day", "dinh": ["A", "B", "C", "D"], "kieu": "hinh_vuong", "canh": "a"}, {"loai": "vuong_goc_mat", "ten": "S", "tai": "A", "mat": ["A", "B", "C"], "do_dai": "a"}, {"loai": "chop", "dinh": "S", "day": ["A", "B", "C", "D"]}, {"loai": "giao_hai_duong", "ten": "O", "d1": ["A", "C"], "d2": ["B", "D"]}, {"loai": "doan", "cua": ["A", "C"]}, {"loai": "doan", "cua": ["B", "D"]}], "so_do": [{"loai": "vuong_goc", "duong": ["B", "C"], "mat": ["S", "A", "B"]}, {"loai": "vuong_goc", "mat1": ["S", "A", "C"], "mat2": ["S", "B", "D"]}, {"loai": "vuong_goc", "d1": ["B", "D"], "d2": ["S", "C"]}], "yeu_cau": ["Chứng minh BC ⊥ (SAB).", "Chứng minh (SAC) ⊥ (SBD).", "Chứng minh BD ⊥ SC."], "gia_dinh": ["Chọn a = 4 đơn vị để vẽ."]},
   {"ten_mau": "Hình hộp chữ nhật", "de_bai": "Cho hình hộp chữ nhật ABCD.A'B'C'D' có AB = a, AD = 2a, AA' = 2a.", "tham_so": {"a": {"gia_tri": 2}}, "dung": [{"loai": "day", "dinh": ["A", "B", "C", "D"], "kieu": "hinh_chu_nhat", "dai": "a", "rong": "2*a"}, {"loai": "lang_tru", "day": ["A", "B", "C", "D"], "tren": ["A'", "B'", "C'", "D'"], "chieu_cao": "2*a"}, {"loai": "doan", "cua": ["A'", "B"]}, {"loai": "doan", "cua": ["A'", "D"]}, {"loai": "doan", "cua": ["B", "D"]}, {"loai": "doan", "cua": ["A", "C'"]}, {"loai": "doan", "cua": ["A'", "C'"]}], "so_do": [{"loai": "khoang_cach_diem_mat", "diem": "A", "mat": ["A'", "B", "D"]}, {"loai": "goc_duong_mat", "duong": ["A", "C'"], "mat": ["A", "B", "C"]}, {"loai": "khoang_cach_hai_duong", "d1": ["B", "D"], "d2": ["A'", "C'"]}], "yeu_cau": ["Tính khoảng cách từ A đến (A'BD).", "Tính góc giữa AC' và (ABCD).", "Tính khoảng cách giữa BD và A'C'."], "gia_dinh": ["Chọn a = 2 đơn vị để vẽ."]},
+{"ten_mau": "Thiết diện song song, diện tích lớn nhất (HSG)", "de_bai": "Cho hình chóp S.ABCD có đáy ABCD là hình thang cân (AD // BC), BC = 2a, AB = AD = DC = a. Mặt bên SBC là tam giác đều, O = AC ∩ BD, SD ⊥ AC. Mặt phẳng (α) qua điểm M thuộc đoạn OD (M khác O, D) và song song với SD và AC. Đặt MD = x.", "yeu_cau": ["Tính SD.", "Xác định thiết diện của hình chóp cắt bởi (α).", "Tìm x để diện tích thiết diện lớn nhất."], "tham_so": {"a": {"gia_tri": 4}, "h": {"gia_tri": 6}, "x": {"gia_tri": 1, "min": 0, "max": 2.3, "nhan": "x = MD"}}, "dung": [{"loai": "day", "dinh": ["B", "C", "D", "A"], "kieu": "hinh_thang", "day_lon": "2*a", "day_nho": "a", "chieu_cao": "a*sqrt(3)/2"}, {"loai": "trung_diem", "ten": "H", "cua": ["B", "C"]}, {"loai": "vuong_goc_mat", "ten": "S", "tai": "H", "mat": ["A", "B", "C"], "do_dai": "h"}, {"loai": "chop", "dinh": "S", "day": ["A", "B", "C", "D"]}, {"loai": "giao_hai_duong", "ten": "O", "d1": ["A", "C"], "d2": ["B", "D"]}, {"loai": "chia_doan", "ten": "M", "cua": ["D", "O"], "ti_so": "x*sqrt(3)/a"}, {"loai": "thiet_dien", "qua": ["M"], "song_song": [["S", "D"], ["A", "C"]], "ten": "α"}], "dieu_kien": [{"loai": "do_dai", "doan": ["S", "B"], "bang": "2*a", "tham_so": "h"}], "so_do": [{"loai": "do_dai", "doan": ["S", "D"]}, {"loai": "dien_tich", "thiet_dien": true}, {"loai": "cuc_tri", "tim": "max", "bien": "x", "tu": "0", "den": "a*sqrt(3)/3", "cua": {"loai": "dien_tich", "thiet_dien": true}}], "gia_dinh": ["SBC đều và SD ⊥ AC nên hình chiếu của S lên đáy là trung điểm H của BC.", "Chọn a = 4 đơn vị để vẽ."]},
+  {"ten_mau": "Hình hộp: thiết diện song song với (ACD')", "de_bai": "Cho hình lập phương ABCD.A'B'C'D' cạnh a. Trên cạnh AB lấy điểm M khác A và B, AM = x. Gọi (P) là mặt phẳng qua M và song song với (ACD').", "yeu_cau": ["Dựng thiết diện của hình hộp cắt bởi (P).", "Xác định vị trí của M để thiết diện có diện tích lớn nhất."], "tham_so": {"a": {"gia_tri": 4}, "x": {"gia_tri": 1.6, "min": 0, "max": 4, "nhan": "x = AM"}}, "dung": [{"loai": "day", "dinh": ["A", "B", "C", "D"], "kieu": "hinh_vuong", "canh": "a"}, {"loai": "lang_tru", "day": ["A", "B", "C", "D"], "tren": ["A'", "B'", "C'", "D'"], "chieu_cao": "a"}, {"loai": "chia_doan", "ten": "M", "cua": ["A", "B"], "ti_so": "x/a"}, {"loai": "doan", "cua": ["A", "C"]}, {"loai": "doan", "cua": ["C", "D'"]}, {"loai": "doan", "cua": ["A", "D'"]}, {"loai": "thiet_dien", "qua": ["M"], "song_song_mat": ["A", "C", "D'"], "ten": "P"}], "so_do": [{"loai": "dien_tich", "thiet_dien": true}, {"loai": "cuc_tri", "tim": "max", "bien": "x", "tu": "0", "den": "a", "cua": {"loai": "dien_tich", "thiet_dien": true}}], "gia_dinh": ["Chọn a = 4 đơn vị để vẽ."]},
 ];
 if (typeof module !== "undefined") module.exports = SAMPLES;
 
@@ -4317,7 +5095,16 @@ window.TMGemini = module.exports;
   function fmtMeasure(m) {
     const a = state.solved?.pv?.a;
     // giá trị đúng (dạng a√2/2, cos = √10/5...) khi nhận ra được, kèm số gần đúng
-    const ex = (k) => (a ? TM.exact(m.v, k, a) : null);
+    const ex = (k) => (a ? TM.exact(m.v, k, a, { sum: true }) : null);
+    if (m.opt) {
+      // giá trị lớn nhất, nhỏ nhất: kèm vị trí đạt được
+      const base = fmtMeasure({ ...m, opt: null });
+      const pr = state.params?.[m.bien];
+      const ratio = pr && pr.max <= 1.0001 && pr.min >= -0.0001;
+      const at = ratio ? TM.exactLoose(m.at) : (a ? TM.exactLoose(m.at, 1, a) : null);
+      return `${base}<small>khi ${esc(m.bien)} ${at ? "= " + esc(at) : "≈ " + TM.fmt(m.at)}${m.edge ? " (đầu mút)" : ""}</small>`;
+    }
+    if (m.kind === "ratio") { const e = TM.exact(m.v); return `${TM.fmt(m.v)}${e && e !== TM.fmt(m.v) ? `<small>= ${esc(e)}</small>` : ""}`; }
     if (m.kind === "angle") { const e = TM.exactAngle(m.v); return e && !/°$/.test(e) ? `${TM.fmt(m.v, 2)}°<small>${esc(e)}</small>` : `${TM.fmt(m.v, 2)}°`; }
     if (m.kind === "check") return m.v ? "đúng ✓" : "không thỏa trên hình";
     if (m.kind === "length") return `${TM.fmt(m.v)}${a ? `<small>${ex(1) ? "= " + esc(ex(1)) : `≈ ${TM.fmt(m.v / a)}a`}</small>` : ""}`;
@@ -4377,7 +5164,7 @@ window.TMGemini = module.exports;
   }
 
   function auxValue(g) {
-    if (!g?.c || g.given || /^(thiet_dien|giao_tuyen|giao_diem|the_tich|vuong_goc|song_song|ai)$/.test(g.key)) return "";
+    if (!g?.c || g.given || /^(thiet_dien|giao_tuyen|giao_diem|the_tich|vuong_goc|song_song|ai|cuc_tri|ti_so)$/.test(g.key)) return "";
     try { const m = TM.measure(g.c, state.M); return isFinite(m.v) ? ` ≈ ${fmtMeasure(m).replace(/<small>/, " (").replace(/<\/small>/, ")")}` : ""; } catch { return ""; }
   }
 
@@ -4408,13 +5195,26 @@ window.TMGemini = module.exports;
       try {
         const m = TM.measure(c, M);
         const val = m.kind === "line" ? esc((state.aux?.groups || []).find((g) => g.c === c)?.result?.split(" = ").pop() || "—") : fmtMeasure(m);
-        rows.push(`<dt>${esc(m.label)}${cond ? ` <span class="muted">(giả thiết)</span>` : ""}</dt><dd>${val}</dd>`);
+        const btn = m.opt && state.params?.[m.bien] && !(state.solved?.locked || new Set()).has(m.bien)
+          ? ` <button type="button" class="chip opt-set" data-bien="${esc(m.bien)}" data-at="${m.at}">Đặt ${esc(m.bien)} tại đây</button>` : "";
+        rows.push(`<dt>${esc(m.label)}${cond ? ` <span class="muted">(giả thiết)</span>` : ""}</dt><dd>${val}${btn}</dd>`);
       } catch (e) { rows.push(`<dt>${esc(c.loai)}</dt><dd>—</dd>`); }
     }
     if (M?.solid && !list.some((x) => x.c.loai === "the_tich")) {
       try { const m = TM.measure({ loai: "the_tich" }, M); rows.push(`<dt>${esc(m.label)}</dt><dd>${fmtMeasure(m)}</dd>`); } catch { /* bỏ qua */ }
     }
     $("#measures").innerHTML = rows.join("") || `<dt class="muted">Không có số đo.</dt><dd></dd>`;
+    // đưa tham số về vị trí đạt giá trị lớn nhất, nhỏ nhất để xem hình lúc đó
+    $("#measures").querySelectorAll("button.opt-set").forEach((b) => {
+      b.onclick = () => {
+        const k = b.dataset.bien, v = Number(b.dataset.at);
+        if (!isFinite(v) || !(k in state.free)) return;
+        const p = state.params[k];
+        if (p) { p.min = Math.min(p.min, v); p.max = Math.max(p.max, v); }
+        state.free[k] = v;
+        compute(); renderPanels(); render();
+      };
+    });
   }
 
   // ---------------- tương tác trên hình ----------------
@@ -4667,10 +5467,16 @@ CÁC LOẠI BƯỚC ("loai")
   giao_hai_duong{ten, d1:[A,B], d2:[C,D]} (hai đường cùng một mặt phẳng); giao_duong_mat{ten, duong:[P,Q], mat:[A,B,C]};
   hinh_chieu_duong{ten, diem, duong:[A,B]}; hinh_chieu_mat{ten, diem, mat:[A,B,C]}; tinh_tien{ten, diem, theo:[A,B]}; doi_xung{ten, diem, qua}; diem{ten, toa_do:[x,y,z]} (chỉ khi thật cần).
 - doan{cua:[P,Q]}: nối thêm đoạn cần cho hình (đường cao, đường chéo đáy, đoạn được nhắc trong đề hoặc câu hỏi như MN...). Cạnh của khối tự được vẽ.
-- thiet_dien{qua:[P,Q,R]} khi đề hỏi thiết diện. to_mat{cua:[...]}; goc_vuong{tai, canh:[P,Q]}; goc{tai, canh:[P,Q], nhan}.
+- thiet_dien: mặt phẳng cắt khi đề hỏi thiết diện (hoặc giao điểm của một mặt phẳng với các cạnh). Mặt phẳng cho bằng "qua" (1–3 điểm) kèm, nếu cần, một trong:
+  song_song:[[P,Q]] hoặc [[P,Q],[R,T]] (song song với đường PQ, RT); song_song_mat:[A,B,C] (song song với mặt phẳng); vuong_goc:[P,Q] (vuông góc với đường PQ); vuong_goc_mat:[A,B,C] (vuông góc với mặt phẳng).
+  Ví dụ: "(P) qua M song song với SD và AC" → {"loai":"thiet_dien","qua":["M"],"song_song":[["S","D"],["A","C"]]}; "(α) chứa BN và song song với MC" → qua:["B","N"], song_song:[["M","C"]]; "(P) qua M song song với (ACD')" → song_song_mat:["A","C","D'"]; "(P) qua A vuông góc với SC" → qua:["A"], vuong_goc:["S","C"]; "(α) chứa CD và vuông góc với (SAB)" → qua:["C","D"], vuong_goc_mat:["S","A","B"]; mặt phẳng qua ba điểm → qua:[M,N,P].
+  "ten": tên mặt phẳng trong đề ("α", "P"). "dinh": tên các giao điểm đề đặt, ví dụ "(P) cắt SB, SD tại H, K" → "dinh":{"SB":"H","SD":"K"}; sau đó dùng được H, K trong so_do.
+- to_mat{cua:[...]}; goc_vuong{tai, canh:[P,Q]}; goc{tai, canh:[P,Q], nhan}.
+Điểm di động (M thay đổi trên đoạn, AM = x...): tạo tham số có khoảng, ví dụ "tham_so":{"a":4,"x":{"gia_tri":1,"min":0,"max":4}}, rồi chia_doan với ti_so theo x (AM = x trên AB cạnh a → ti_so "x/a"; MA/MD = x → ti_so "x/(1+x)").
 Mỗi bước có thể thêm "mo_ta": một câu tiếng Việt ngắn.
 
-Đại lượng (dùng cho dieu_kien và so_do): goc_duong_mat{duong:[P,Q], mat:[A,B,C]} | goc_hai_mat{mat1, mat2} | goc_hai_duong{d1, d2} | goc{tai, canh:[P,Q]} (góc PXQ, ví dụ góc ASC = 90°) | do_dai{doan:[P,Q]} | khoang_cach_diem_mat{diem, mat} | khoang_cach_diem_duong{diem, duong} | khoang_cach_hai_duong{d1, d2} | the_tich{} (cả khối) hoặc the_tich{dinh, day:[...]} (khối chóp con, tứ diện, ví dụ V(S.AMN), V(M.ABC)) | dien_tich{cua:[...]} | mat_cau{} (bán kính mặt cầu ngoại tiếp khối) hoặc mat_cau{dinh, day} (mặt cầu ngoại tiếp chóp con, tứ diện).
+Đại lượng (dùng cho dieu_kien và so_do): goc_duong_mat{duong:[P,Q], mat:[A,B,C]} | goc_hai_mat{mat1, mat2} | goc_hai_duong{d1, d2} | goc{tai, canh:[P,Q]} (góc PXQ, ví dụ góc ASC = 90°) | do_dai{doan:[P,Q]} | khoang_cach_diem_mat{diem, mat} | khoang_cach_diem_duong{diem, duong} | khoang_cach_hai_duong{d1, d2} | the_tich{} (cả khối) hoặc the_tich{dinh, day:[...]} (khối chóp con, tứ diện, ví dụ V(S.AMN), V(M.ABC)) | dien_tich{cua:[...]} hoặc dien_tich{thiet_dien:true} (diện tích thiết diện) | chu_vi{cua:[...]} hoặc chu_vi{thiet_dien:true} | ti_so{tu:[P,Q], mau:[R,T]} (tỉ số PQ/RT, ví dụ SM/SA) | mat_cau{} (bán kính mặt cầu ngoại tiếp khối) hoặc mat_cau{dinh, day} (mặt cầu ngoại tiếp chóp con, tứ diện).
+Câu tìm giá trị lớn nhất, nhỏ nhất khi điểm di động: cuc_tri{tim:"max" hoặc "min", bien:"x", tu: biểu thức đầu khoảng, den: biểu thức cuối khoảng, cua: đại lượng ở trên}, ví dụ "tìm x để thiết diện có diện tích lớn nhất, 0 < x < a√3/3" → {"loai":"cuc_tri","tim":"max","bien":"x","tu":"0","den":"a*sqrt(3)/3","cua":{"loai":"dien_tich","thiet_dien":true}}.
 dieu_kien: [{"loai": một đại lượng ở trên, "bang": giá trị (độ hoặc biểu thức theo tham số), "tham_so": tên tham số cần giải}]. Ví dụ: "SC tạo với đáy góc 60°" → goc_duong_mat; "mặt bên (SCD) tạo với đáy góc α, tan α = 2" → goc_hai_mat với "bang":"atan(2)"; "khoảng cách từ A đến (SBC) bằng a/2" → khoang_cach_diem_mat; "thể tích bằng a³√3/6" → the_tich.
 so_do: các đại lượng đề hỏi, cùng dạng nhưng không có "bang", "tham_so"; có thêm giao_tuyen{mat1, mat2}, giao_diem{duong, mat} (tìm giao điểm của đường thẳng và mặt phẳng).
 Câu chứng minh: vuong_goc{duong, mat} | vuong_goc{mat1, mat2} | vuong_goc{d1, d2}; song_song{duong, mat} | song_song{mat1, mat2} | song_song{d1, d2}.
@@ -4678,7 +5484,7 @@ hinh_phu (tùy chọn): [{"so_do": số thứ tự câu trong so_do (từ 0) n�
 Phần mềm TỰ DỰNG HÌNH PHỤ cho từng mục trong so_do (chân đường vuông góc, hình chiếu, giao tuyến, giao điểm khi kéo dài, ký hiệu góc). Vì vậy:
 - Ghi vào so_do ĐẦY ĐỦ mọi câu hỏi về góc, khoảng cách, thể tích (cả khối con), mặt cầu ngoại tiếp, giao tuyến, giao điểm, chứng minh vuông góc, song song, theo đúng thứ tự trong đề.
 - Đoạn được nhắc trong đề hoặc câu hỏi mà chưa có trên hình (ví dụ đường cao SH, đoạn MN, AM, BH) thì thêm bước doan để vẽ ra. KHÔNG thêm doan cho cạnh của khối (SA, SB, AB, AA'...) vì cạnh đã tự được vẽ.
-- Câu hỏi xác định thiết diện thì thêm bước thiet_dien vào dung (phần mềm tự dựng cách tìm thiết diện).
+- Câu hỏi xác định thiết diện thì thêm bước thiet_dien vào dung (phần mềm tự dựng cách tìm thiết diện); câu tính diện tích, chu vi thiết diện thì thêm dien_tich{thiet_dien:true}, chu_vi{thiet_dien:true} vào so_do.
 - Không cần tự thêm vào dung các điểm, đoạn phụ chỉ phục vụ lời giải (như chân đường cao H, K); chỉ dựng những gì đề bài nêu.`;
 
   const EXAMPLES = [SAMPLES[1], SAMPLES[3]].map((s) => { const o = structuredClone(s); delete o.ten_mau; return JSON.stringify(o); }).join("\n\n");
