@@ -106,6 +106,10 @@
   .auxlist > li.cur { border-color: var(--aux); background: var(--aux-soft); }
   .auxlist ol { margin: 6px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 3px; }
   .auxlist .res { margin: 6px 0 0; font-weight: 600; color: var(--aux-ink); }
+  .auxlist .calc { margin: 6px 0 0; padding: 7px 9px; border-radius: 7px; background: var(--surface-2); font-size: 13px; }
+  .auxlist .calc b { display: block; font-size: 11.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+  .auxlist .calc ul { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 2px; }
+  .auxlist .calc li:last-child { font-weight: 600; }
   .toast {
     position: absolute; left: 50%; top: 12px; transform: translateX(-50%); max-width: calc(100% - 20px); padding: 8px 14px; border-radius: 9px;
     background: var(--ink); color: var(--surface); font-size: 13px; overflow-wrap: anywhere;
@@ -294,7 +298,7 @@
           <ol class="steps" id="steps"></ol>
         </section>
         <section>
-          <h2>Hình phụ tự dựng</h2>
+          <h2>Hình phụ và gợi ý lời giải</h2>
           <ul class="auxlist" id="auxList"></ul>
           <label class="muted" style="display:flex;gap:8px;align-items:flex-start;margin-top:10px"><input type="checkbox" id="spread" checked style="margin-top:3px"> Dời chân đường vuông góc nằm quá sát điểm khác cho dễ nhìn (như hình minh họa trong sách; số đo vẫn đúng)</label>
           <label class="muted" style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><input type="checkbox" id="auxColor" style="margin-top:3px"> Tô màu riêng cho đường phụ (mặc định vẽ cùng nét với hình như trong sách)</label>
@@ -1305,9 +1309,64 @@ const TM = (() => {
     return { yaw: best.yaw * DEG, pitch: best.pitch * DEG, skew: best.skew };
   }
 
+  // ---------- giá trị đúng: nhận dạng số dạng p√s/q (s không chứa thừa số chính phương) ----------
+  // x² gần như luôn là số hữu tỉ trong các bài hình không gian: tìm phân số n/d ≈ x² bằng liên phân số
+  const gcd = (x, y) => (y ? gcd(y, x % y) : x);
+  function ratApprox(y, maxD = 20000, tol = 1e-11) {
+    let h0 = 0, h1 = 1, k0 = 1, k1 = 0, z = y;
+    for (let i = 0; i < 40; i++) {
+      const a = Math.floor(z);
+      const h2 = a * h1 + h0, k2 = a * k1 + k0;
+      if (k2 > maxD) break;
+      if (Math.abs(h2 / k2 - y) <= tol * Math.max(1, y)) return [h2, k2];
+      h0 = h1; h1 = h2; k0 = k1; k1 = k2;
+      const f = z - a;
+      if (f < 1e-15) break;
+      z = 1 / f;
+    }
+    return null;
+  }
+  function exactNum(r) {
+    if (!isFinite(r)) return null;
+    const sg = r < 0 ? -1 : 1, x = Math.abs(r);
+    if (x < 1e-12) return { p: 0, q: 1, s: 1 };
+    const fr = ratApprox(x * x);
+    if (!fr) return null;
+    const [n, d] = fr;
+    // √(n/d) = √(n·d)/d; tách thừa số chính phương của n·d
+    let t = n * d, k = 1;
+    if (!Number.isSafeInteger(t)) return null;
+    for (let f = 2; f * f <= t; f++) while (t % (f * f) === 0) { t /= f * f; k *= f; }
+    if (t > 100000) return null;
+    const g = gcd(k, d);
+    return { p: (sg * k) / g, q: d / g, s: t };
+  }
+  const SUP = { 2: "²", 3: "³" };
+  // x: giá trị trên hình; k: bậc theo đơn vị a (độ dài 1, diện tích 2, thể tích 3, tỉ số 0)
+  function exact(x, k = 0, a = null) {
+    const u = a && k ? Math.pow(a, k) : 1;
+    const e = exactNum(x / u);
+    if (!e) return null;
+    if (e.p === 0) return "0";
+    const ap = Math.abs(e.p), unitS = a && k ? "a" + (SUP[k] || "") : "";
+    const num = (ap === 1 && (unitS || e.s > 1) ? "" : String(ap)) + unitS + (e.s > 1 ? "√" + e.s : "");
+    return (e.p < 0 ? "−" : "") + (num || "1") + (e.q > 1 ? "/" + e.q : "");
+  }
+  // góc: số đo đẹp thì ghi độ, nếu không thì ghi cos (hoặc tan) dạng đúng
+  function exactAngle(deg) {
+    const r = Math.round(deg * 2) / 2;
+    if (Math.abs(r - deg) < 1e-7 && (Number.isInteger(r / 15) || Number.isInteger(r / 18) || r === 90)) return `${r}°`;
+    const c = Math.cos(deg * DEG), t = Math.tan(deg * DEG);
+    const ec = exact(c), et = Math.abs(deg - 90) > 1e-6 ? exact(t) : null;
+    if (ec) return `cos = ${ec}`;
+    if (et) return `tan = ${et}`;
+    const es = exact(Math.sin(deg * DEG));
+    return es ? `sin = ${es}` : null;
+  }
+
   return {
     GeoError, evalExpr, normParams, build, solve, measure, camera, basis, makeOccluder, splitSegment, autoView,
-    fmt, prettyExpr, vec: { add, sub, mul, dot, cross, len, lerp, unit }, DEG, planeName, planeOf, sectionPolygon, joinNames, nameRank, circumsphere,
+    exact, exactAngle, fmt, prettyExpr, vec: { add, sub, mul, dot, cross, len, lerp, unit }, DEG, planeName, planeOf, sectionPolygon, joinNames, nameRank, circumsphere,
   };
 })();
 if (typeof module !== "undefined") module.exports = TM;
@@ -1561,6 +1620,7 @@ const TMAux = (() => {
       const n1 = PN(c.mat1), n2 = PN(c.mat2);
       const L = intersectionLine(c.mat1, c.mat2, true);
       if (!L) { grp.result = `${n1} ∥ ${n2} nên góc bằng 0°`; return; }
+      const nL = grp.steps.length;
       grp.steps.push(...L.steps);
       const L1 = add(L.L0, L.d);
       const onD = (X) => onLine(X, L.L0, L1);
@@ -1570,7 +1630,8 @@ const TMAux = (() => {
           if (!onPl(X, A) || onD(X)) continue;
           const Xp = footPl(X, B), K = footLn(X, L.L0, L1);
           if (same(Xp, K) || far(Xp) || far(K)) continue;
-          const score = (nameIn(Xp) ? 0 : 1) + (nameIn(K) ? 0 : 1) + (xn === apex ? -0.3 : 0) + (an === n1 ? 0 : 0.05);
+          // hình chiếu Xp chưa có tên thì phải tính thêm khoảng cách XXp, khó hơn
+          const score = (nameIn(Xp) ? 0 : 1.6) + (nameIn(K) ? 0 : 1) + (xn === apex ? -0.3 : 0) + (an === n1 ? 0 : 0.05);
           if (!best || score < best.score - 1e-9) best = { score, xn, X, Xp, K, an, bn };
         }
       }
@@ -1604,7 +1665,8 @@ const TMAux = (() => {
               if (sP < 1e-6 || sP > 1 - 1e-6) continue;
               const Y = add(U, mul(e, sP));
               if (same(Y, K) || onD(Y)) continue;
-              const sc = (nameIn(K) ? 0 : 1) + (nameIn(Y) ? 0 : 1) - 0.1;
+              // Y mới trên cạnh: tính góc XKY thường khó (phải tính thêm KY, XY)
+              const sc = (nameIn(K) ? 0 : 1) + (nameIn(Y) ? 0 : 1) + 0.4;
               if (!sym || sc < sym.sc) sym = { sc, xn, X, yn: null, Y, K, e1, e2, P2 };
             }
           }
@@ -1623,6 +1685,32 @@ const TMAux = (() => {
           seg(s, L.U, L.V, { thin: true }); grp.steps.push(s);
         }
       };
+      // cách dùng hai đường vuông góc: từ một điểm X kẻ XH1 ⊥ (P1), XH2 ⊥ (P2); góc giữa hai mặt phẳng bằng góc giữa XH1 và XH2.
+      // Hay dùng khi hai mặt đều là mặt bên (chân đường cao dễ dựng, tam giác XH1H2 tính được).
+      let nor = null;
+      for (const [xn, X] of M.pts) {
+        if (/^[a-z]/.test(xn) || onPl(X, L.p1) || onPl(X, L.p2)) continue;
+        const q1 = planDM(xn, L.p1), q2 = planDM(xn, L.p2);
+        const easy = (q) => q && (/^(direct|A)$/.test(q.type) || (q.type === "B" && q.score <= 1.5));
+        if (!easy(q1) || !easy(q2) || same(q1.H, q2.H)) continue;
+        const sc = 0.3 + q1.score + q2.score + (xn === apex ? 0.3 : 0);
+        if (!nor || sc < nor.sc) nor = { sc, xn, X, q1, q2 };
+      }
+      if (nor && nor.sc < Math.min(best ? best.score : Infinity, sym ? sym.sc : Infinity)) {
+        grp.steps.splice(nL, L.steps.length);
+        const { xn, X, q1, q2 } = nor;
+        emitDM(grp, xn, L.p1, n1, q1);
+        emitDM(grp, xn, L.p2, n2, q2);
+        const H1 = q1.H, H2 = q2.H, h1 = nameOf(H1), h2 = nameOf(H2);
+        const cs = dot(sub(H1, X), sub(H2, X)) / len(sub(H1, X)) / len(sub(H2, X));
+        const s3 = St(`Vì ${xn}${h1} ⊥ ${n1} và ${xn}${h2} ⊥ ${n2} nên góc giữa ${n1} và ${n2} bằng góc giữa ${xn}${h1} và ${xn}${h2}`
+          + (cs >= -1e-9 ? `, tức là góc ${h1}${xn}${h2}` : `; góc ${h1}${xn}${h2} tù nên góc cần tìm bằng 180° − ∠${h1}${xn}${h2}`));
+        seg(s3, H1, H2, { thin: true }); seg(s3, X, H1, { emph: true }); seg(s3, X, H2, { emph: true });
+        const lab = mark(s3, "arc", X, H1, H2, greek());
+        grp.steps.push(s3);
+        grp.result = cs >= -1e-9 ? `Góc giữa ${n1} và ${n2} = ∠${h1}${xn}${h2}${lab ? " = " + lab : ""}` : `Góc giữa ${n1} và ${n2} = 180° − ∠${h1}${xn}${h2}`;
+        return;
+      }
       if (sym && (!best || sym.sc < best.score)) {
         drawLine();
         const { xn, X, yn, Y, K } = sym, dn = L.name;
@@ -1815,9 +1903,20 @@ const TMAux = (() => {
         let txtA = `Kẻ ${xn}${hN} ⊥ ${pair(u, w)} tại ${hN}. Khi đó ${xn}${hN} ⊥ ${mn}`;
         if (!isFresh(hN)) {
           // điểm H có sẵn: chỉ ra hai đường cắt nhau tại H trong mặt phẳng cùng vuông góc với XH
-          const l2 = linesOn(pl).filter(([a, b, virt]) => onLine(H, g(a), g(b)) && len(cross(sub(g(b), g(a)), sub(g(w), g(u)))) > 1e-6 * len(sub(g(b), g(a))) * len(sub(g(w), g(u))))
-            .sort((x, y) => (x[2] ? 1 : 0) - (y[2] ? 1 : 0))[0];
-          const why = (a, b) => (isVert(a, b) && basePlane && onPl(X, basePlane) ? ` (vì ${pair(a, b)} ⊥ ${PN(M.solid.base.slice(0, 3))})` : "");
+          // đường thứ hai: ưu tiên cạnh của khối (ví dụ BC, vì BC ⊥ (SAB)), sau đó mới tới đường qua H
+          const npar = (a, b) => len(cross(sub(g(b), g(a)), sub(g(w), g(u)))) > 1e-6 * len(sub(g(b), g(a))) * len(sub(g(w), g(u)));
+          const perpTo = (a, b) => Math.abs(dot(sub(g(b), g(a)), sub(X, H))) < 1e-7 * len(sub(g(b), g(a))) * len(sub(X, H));
+          const faceWhy = (a, b) => {
+            const d = TM.vec.unit(sub(g(b), g(a)));
+            const f = (M.solid ? M.solid.faces : []).find((fc) => { try { const fp = TM.planeOf(M, fc.names.slice(0, 3)); return onPl(X, fp) && onPl(H, fp) && len(cross(fp.n, d)) < 1e-6; } catch { return false; } });
+            return f ? ` (vì ${pair(a, b)} ⊥ ${PN(f.names.slice(0, 3))})` : "";
+          };
+          const cands2 = linesOn(pl).filter(([a, b]) => npar(a, b) && perpTo(a, b));
+          const edgeOf = (a, b) => (M.solid ? M.solid.edges : []).some(([e1, e2]) => (e1 === a && e2 === b) || (e1 === b && e2 === a));
+          const why = (a, b) => (isVert(a, b) && basePlane && onPl(X, basePlane) ? ` (vì ${pair(a, b)} ⊥ ${PN(M.solid.base.slice(0, 3))})` : faceWhy(a, b));
+          // ưu tiên đường có lý do sẵn (⊥ đáy, ⊥ một mặt chứa XH), rồi tới cạnh của khối
+          const k2 = (l) => (l[2] ? 2 : 0) + (why(l[0], l[1]) ? 0 : 1.2) + (edgeOf(l[0], l[1]) ? 0 : 0.5);
+          const l2 = cands2.sort((x, y) => k2(x) - k2(y))[0];
           txtA = l2 ? `Ta có ${xn}${hN} ⊥ ${pair(u, w)}${why(u, w)} và ${xn}${hN} ⊥ ${pair(l2[0], l2[1])}${why(l2[0], l2[1])} nên ${xn}${hN} ⊥ ${mn}`
             : `Ta có ${xn}${hN} ⊥ ${pair(u, w)} và ${xn}${hN} ⊥ ${mn}`;
         }
@@ -2398,12 +2497,27 @@ const TMAux = (() => {
       if (c && c.dinh && Array.isArray(c.day) && c.day.length >= 3) {
         const pl = plane(c.day.slice(0, 3)), bn = "(" + c.day.join("") + ")";
         const X = g(c.dinh), H = footPl(X, pl);
-        const hN = alloc(H, ["H", "O"]);
+        // X nằm trên đoạn VU với VW ⊥ đáy (W, U trong đáy): kẻ XF ∥ VW, F ∈ WU (như cách làm trong sách)
+        let par = null;
+        if (!nameIn(H)) {
+          for (const [vn, V] of M.pts) for (const [wn, W] of M.pts) {
+            if (par || vn === wn || onPl(V, pl) || !onPl(W, pl) || len(cross(sub(V, W), pl.n)) > 1e-6 * len(sub(V, W))) continue;
+            if (!(hasSeg(vn, wn) || M.solid?.edges.some(([e1, e2]) => (e1 === vn && e2 === wn) || (e1 === wn && e2 === vn)))) continue;
+            for (const [un, U] of M.pts) {
+              if (un === wn || !onPl(U, pl) || !onSeg(X, V, U) || same(X, V) || same(X, U)) continue;
+              if (onSeg(H, W, U)) { par = { vn, wn, un }; break; }
+            }
+          }
+        }
+        const hN = alloc(H, par ? ["E", "F", "I", "K", "H"] : ["H", "O"]);
         const s0 = St(`Đáy ${c.day.join("")}`);
         s0.polys.push({ pts: c.day.map(g) });
         for (let i = 0; i < c.day.length; i++) seg(s0, g(c.day[i]), g(c.day[(i + 1) % c.day.length]));
         grp.steps.push(s0);
-        const s = St(isFresh(hN) ? `Gọi ${hN} là hình chiếu vuông góc của ${c.dinh} lên ${bn}; ${c.dinh}${hN} là đường cao` : `${c.dinh}${hN} là đường cao`);
+        const s = St(par && isFresh(hN)
+          ? `Trong ${trio(par.vn, par.wn, par.un)}, kẻ ${c.dinh}${hN} ∥ ${pair(par.vn, par.wn)} (${hN} ∈ ${pair(par.wn, par.un)}). Vì ${pair(par.vn, par.wn)} ⊥ ${nicePlane(pl, bn)} nên ${c.dinh}${hN} ⊥ ${nicePlane(pl, bn)}: ${c.dinh}${hN} là đường cao`
+          : isFresh(hN) ? `Gọi ${hN} là hình chiếu vuông góc của ${c.dinh} lên ${bn}; ${c.dinh}${hN} là đường cao` : `${c.dinh}${hN} là đường cao`);
+        if (par) grp.thales = { x: c.dinh, f: hN, ...par };
         seg(s, X, H, { emph: true }); const Y = other(H, c.day); if (Y) mark(s, "right", H, X, Y); pt(s, hN);
         grp.steps.push(s);
         grp.result = `V = ⅓ · S(${c.day.join("")}) · ${c.dinh}${hN}`;
@@ -2720,11 +2834,102 @@ const TMAux = (() => {
         default: return c.loai;
       }
     };
+    // ---------- tính nhanh: giá trị đúng của các đoạn, góc dùng trong lời giải ----------
+    const aU = M.pv && Number(M.pv.a) > 0 ? Number(M.pv.a) : null;
+    const SUPK = ["", "", "²", "³"];
+    const exS = (v, k = 1) => TM.exact(v, k, aU) || "≈ " + TM.fmt(aU && k ? v / aU ** k : v) + (aU && k ? "a" + SUPK[k] : "");
+    const splitName = (str) => {
+      for (let i = 1; i < str.length; i++) { const a = str.slice(0, i), b = str.slice(i); if (known.has(a) && known.has(b)) return [a, b]; }
+      return null;
+    };
+    const dl = (x, y) => len(sub(g(x), g(y)));
+    const L1 = (x, y) => `${pair(x, y)} = ${exS(dl(x, y))}`;
+    const rightAt = (t, x, y) => Math.abs(dot(sub(g(x), g(t)), sub(g(y), g(t)))) < 1e-7 * dl(x, t) * dl(y, t);
+    const namedPts = () => [...known.keys()].filter((n) => !/^[a-z]/.test(n));
+    // XF là đường cao của tam giác vuông XUV (vuông tại X) thì 1/XF² = 1/XU² + 1/XV²
+    function altitudeLines(xn, fn) {
+      const F = g(fn), X = g(xn);
+      const ns = namedPts();
+      for (let i = 0; i < ns.length; i++) for (let j = i + 1; j < ns.length; j++) {
+        const u = ns[i], v = ns[j];
+        if ([xn, fn].includes(u) || [xn, fn].includes(v)) continue;
+        const U = g(u), V = g(v);
+        if (!onSeg(F, U, V) || !rightAt(xn, u, v)) continue;
+        if (Math.abs(dot(sub(X, F), sub(V, U))) > 1e-7 * len(sub(X, F)) * len(sub(V, U))) continue;
+        return [`Tam giác ${xn}${pair(u, v)} vuông tại ${xn}, đường cao ${pair(xn, fn)}: 1/${pair(xn, fn)}² = 1/${pair(xn, u)}² + 1/${pair(xn, v)}²`,
+          `${L1(xn, u)}, ${L1(xn, v)} ⇒ ${L1(xn, fn)}`];
+      }
+      return [L1(xn, fn)];
+    }
+    function calcOf(grp) {
+      const c = grp.c, out = [];
+      if (!c) return out;
+      let m = null;
+      try { m = TM.measure(c, M); } catch { m = null; }
+      const lastArc = () => { for (let i = grp.steps.length - 1; i >= 0; i--) { const mk = grp.steps[i].marks.filter((x) => x.kind === "arc").pop(); if (mk) return mk; } return null; };
+      if (/^khoang_cach/.test(c.loai)) {
+        const mt = /=\s*(?:(\d+(?:\/\d+)?)·)?([A-Z][A-Za-z'₁₂]*)\s*$/.exec(grp.result || "");
+        const sp = mt && splitName(mt[2]);
+        if (sp) {
+          // chân đường vuông góc là điểm thứ hai (XH, HK...) – thử cả hai chiều
+          let lines = altitudeLines(sp[0], sp[1]);
+          if (lines.length === 1) { const l2 = altitudeLines(sp[1], sp[0]); if (l2.length > 1) lines = l2; }
+          out.push(...lines);
+          if (mt[1]) out.push(`d = ${mt[1]}·${pair(sp[0], sp[1])} = ${exS(eval0(mt[1]) * dl(sp[0], sp[1]))}`);
+        }
+        if (m) out.push(`Đáp số: ${m.label.replace(/^Khoảng cách/, "khoảng cách")} = ${exS(m.v)}`);
+        return out;
+      }
+      if (/^goc_/.test(c.loai) || c.loai === "goc") {
+        if (/sin φ/.test(grp.result || "") && m) {
+          out.push(`sin φ = ${TM.exact(Math.sin(m.v * TM.DEG)) || TM.fmt(Math.sin(m.v * TM.DEG))}`);
+        } else {
+          const mk = lastArc();
+          const tn = mk && nameOf(mk.T), pn = mk && nameOf(mk.P), qn = mk && nameOf(mk.Q);
+          if (tn && pn && qn) {
+            const ang = `∠${pn}${tn}${qn}`;
+            if (rightAt(qn, pn, tn) || rightAt(pn, qn, tn)) {
+              const [o, r] = rightAt(qn, pn, tn) ? [pn, qn] : [qn, pn]; // vuông tại r; o là đỉnh còn lại
+              out.push(`Tam giác ${tn}${pair(o, r)} vuông tại ${r}: tan${ang} = ${pair(o, r)}/${pair(tn, r)}`);
+              out.push(`${L1(o, r)}, ${L1(tn, r)}`);
+            } else {
+              out.push(`cos${ang} = (${pair(tn, pn)}² + ${pair(tn, qn)}² − ${pair(pn, qn)}²) / (2·${pair(tn, pn)}·${pair(tn, qn)})`);
+              out.push(`${L1(tn, pn)}, ${L1(tn, qn)}, ${L1(pn, qn)}`);
+            }
+          }
+        }
+        if (m) out.push(`${grp.given ? "Theo giả thiết" : "Đáp số"}: ${m.label.replace(/^Góc/, "góc")} ${(() => { const e = TM.exactAngle(m.v); return e && !/°$/.test(e) ? "có " + e + " (≈ " + TM.fmt(m.v, 2) + "°)" : "= " + (e || TM.fmt(m.v, 2) + "°"); })()}`);
+        return out;
+      }
+      if (c.loai === "the_tich" && m) {
+        const S = M.solid;
+        const base = c.dinh && Array.isArray(c.day) ? c.day : S ? S.base : null;
+        const top = c.dinh && Array.isArray(c.day) ? c.dinh : S ? (S.kind === "chop" ? S.apex : S.top[0]) : null;
+        if (base && top) {
+          const P = base.map(g), pl = plane(base.slice(0, 3));
+          let area = 0;
+          for (let i = 1; i + 1 < P.length; i++) area += len(cross(sub(P[i], P[0]), sub(P[i + 1], P[0]))) / 2;
+          const h = Math.abs(sd(g(top), pl));
+          if (grp.thales) {
+            const { x, f, vn, wn, un } = grp.thales;
+            out.push(`${x}${f} ∥ ${pair(vn, wn)} nên ${x}${f}/${pair(vn, wn)} = ${un}${x}/${un}${vn}; ${L1(vn, wn)}, ${un}${x}/${un}${vn} = ${exS(dl(un, x) / dl(un, vn), 0)}`);
+          }
+          const prism = !(c.dinh && Array.isArray(c.day)) && S && S.kind !== "chop";
+          out.push(`S(${base.join("")}) = ${exS(area, 2)}, chiều cao = ${exS(h)}`);
+          out.push(`Đáp số: V = ${prism ? "" : "⅓·"}S·h = ${exS(m.v, 3)}`);
+        }
+        return out;
+      }
+      if (c.loai === "mat_cau" && m) out.push(`Đáp số: R = ${exS(m.v)}`);
+      return out;
+    }
+    const eval0 = (f) => { const [p, q] = String(f).split("/").map(Number); return q ? p / q : p; };
     const run = (c, fn, given) => {
       grpFresh = new Set();
       const grp = { key: c.loai, short: short(c) + (given ? " (gt)" : ""), title: "", steps: [], result: "", c, given: !!given };
       try { grp.title = TM.measure(c, M).label; } catch { grp.title = grp.short; }
       try { fn(grp); } catch (e) { grp.steps = []; grp.err = "Chưa tự dựng được hình phụ cho câu này"; }
+      if (!grp.err) { try { grp.calc = calcOf(grp); } catch { grp.calc = []; } }
       out.groups.push(grp);
     };
     const handlers = {
@@ -3756,11 +3961,13 @@ window.TMGemini = module.exports;
   // ---------------- bảng điều khiển ----------------
   function fmtMeasure(m) {
     const a = state.solved?.pv?.a;
-    if (m.kind === "angle") return `${TM.fmt(m.v, 2)}°`;
+    // giá trị đúng (dạng a√2/2, cos = √10/5...) khi nhận ra được, kèm số gần đúng
+    const ex = (k) => (a ? TM.exact(m.v, k, a) : null);
+    if (m.kind === "angle") { const e = TM.exactAngle(m.v); return e && !/°$/.test(e) ? `${TM.fmt(m.v, 2)}°<small>${esc(e)}</small>` : `${TM.fmt(m.v, 2)}°`; }
     if (m.kind === "check") return m.v ? "đúng ✓" : "không thỏa trên hình";
-    if (m.kind === "length") return `${TM.fmt(m.v)}${a ? `<small>≈ ${TM.fmt(m.v / a)}a</small>` : ""}`;
-    if (m.kind === "volume") return `${TM.fmt(m.v)}${a ? `<small>≈ ${TM.fmt(m.v / a ** 3)}a³</small>` : ""}`;
-    if (m.kind === "area") return `${TM.fmt(m.v)}${a ? `<small>≈ ${TM.fmt(m.v / a ** 2)}a²</small>` : ""}`;
+    if (m.kind === "length") return `${TM.fmt(m.v)}${a ? `<small>${ex(1) ? "= " + esc(ex(1)) : `≈ ${TM.fmt(m.v / a)}a`}</small>` : ""}`;
+    if (m.kind === "volume") return `${TM.fmt(m.v)}${a ? `<small>${ex(3) ? "= " + esc(ex(3)) : `≈ ${TM.fmt(m.v / a ** 3)}a³`}</small>` : ""}`;
+    if (m.kind === "area") return `${TM.fmt(m.v)}${a ? `<small>${ex(2) ? "= " + esc(ex(2)) : `≈ ${TM.fmt(m.v / a ** 2)}a²`}</small>` : ""}`;
     return TM.fmt(m.v);
   }
 
@@ -3827,7 +4034,7 @@ window.TMGemini = module.exports;
     bar.innerHTML = G.length ? `<span class="lbl">Hình phụ</span>` + G.map((g, i) => `<button class="chip" type="button" data-aux="${i}" title="${esc(g.title)}">${esc(g.short)}</button>`).join("")
       + (G.length > 1 ? `<button class="chip" type="button" data-aux="all">Tất cả</button>` : "") + `<button class="chip" type="button" data-aux="none">Ẩn</button>` : "";
     bar.querySelectorAll("button[data-aux]").forEach((b) => { b.onclick = () => selectAux(b.dataset.aux); });
-    $("#auxList").innerHTML = G.map((g, i) => `<li data-aux="${i}"><b>${esc(g.title)}</b>${g.err ? `<p class="muted">${esc(g.err)}</p>` : ""}<ol>${g.steps.map((s) => `<li>${esc(s.desc)}</li>`).join("")}</ol>${g.result ? `<p class="res">${esc(g.result)}${auxValue(g)}</p>` : ""}</li>`).join("")
+    $("#auxList").innerHTML = G.map((g, i) => `<li data-aux="${i}"><b>${esc(g.title)}</b>${g.err ? `<p class="muted">${esc(g.err)}</p>` : ""}<ol>${g.steps.map((s) => `<li>${esc(s.desc)}</li>`).join("")}</ol>${g.result ? `<p class="res">${esc(g.result)}${auxValue(g)}</p>` : ""}${g.calc && g.calc.length ? `<div class="calc"><b>Tính nhanh (giá trị đúng)</b><ul>${g.calc.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>` : ""}</li>`).join("")
       || `<li class="muted">Đề này chưa có câu hỏi cần dựng hình phụ.</li>`;
     $("#auxList").querySelectorAll(":scope > li[data-aux]").forEach((li) => { li.onclick = () => selectAux(li.dataset.aux); });
   }
