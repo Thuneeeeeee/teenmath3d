@@ -878,7 +878,15 @@ const TM = (() => {
             const [p, q] = it.d1 || [], [r, s] = it.d2 || [];
             const P = M.get(p), Q = M.get(q), R = M.get(r), S = M.get(s);
             const tol = 1e-6 * Math.max(1, len(sub(Q, P)), len(sub(S, R)));
-            setPt(it.ten, lineLine(P, Q, R, S, tol), step);
+            const X = lineLine(P, Q, R, S, tol);
+            setPt(it.ten, X, step);
+            // như hình trong sách: vẽ luôn hai đường (đường chéo AC, BD...), kéo dài tới giao điểm nếu cần
+            for (const [a, b, A, B] of [[p, q, P, Q], [r, s, R, S]]) {
+              const u = sub(B, A), t = dot(sub(X, A), u) / dot(u, u);
+              if (!segCovered(a, b)) addSeg(a, b, step, "auto");
+              if (t > 1 + 1e-6 && !segCovered(b, it.ten)) addSeg(b, it.ten, step, "auto");
+              if (t < -1e-6 && !segCovered(a, it.ten)) addSeg(a, it.ten, step, "auto");
+            }
             break;
           }
           case "giao_duong_mat": {
@@ -1725,7 +1733,9 @@ const TMAux = (() => {
     const far = (P) => len(sub(P, M.center)) > 3.2 * R;
     const segList = M.segs.map((s) => (s.a ? [g(s.a), g(s.b)] : [s.A, s.B])).filter(([A, B]) => A && B);
     const covered = (A, B) => segList.some(([P, Q]) => onSeg(A, P, Q) && onSeg(B, P, Q));
-    const namedSegs = M.segs.filter((s) => s.a).map((s) => [s.a, s.b]);
+    // đoạn vẽ tự động khi lấy giao điểm (đường chéo AC, BD) không tính là đoạn đề cho khi chọn cách dựng
+    const namedSegs = M.segs.filter((s) => s.a && s.kind !== "auto").map((s) => [s.a, s.b])
+      .concat((Array.isArray(spec?.dung) ? spec.dung : []).filter((it) => it && it.loai === "doan" && Array.isArray(it.cua) && it.cua.length === 2 && M.pts.has(it.cua[0]) && M.pts.has(it.cua[1])).map((it) => [it.cua[0], it.cua[1]]));
     const hasSeg = (a, b) => namedSegs.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
     // các đường vuông góc mặt phẳng đã được chứng minh trong đề (câu chứng minh XY ⊥ (P))
     const proven = (x, y, pl) => (Array.isArray(spec?.so_do) ? spec.so_do : []).some((c) => {
@@ -1807,6 +1817,8 @@ const TMAux = (() => {
     };
     // kéo dài đoạn AB tới X khi X nằm ngoài đoạn
     const extend = (st, X, A, B) => {
+      // đường AB được nhắc tới (chân đường vuông góc, giao điểm nằm trên AB) thì phải có trên hình
+      seg(st, A, B);
       const t = tOn(X, A, B);
       if (t < -1e-6) seg(st, A, X, { thin: true });
       else if (t > 1 + 1e-6) seg(st, B, X, { thin: true });
@@ -1837,6 +1849,19 @@ const TMAux = (() => {
       }
       if (!nameIn(H)) {
         const bd = bestDM(xn, pl, mn);
+        // chân đường vuông góc dựng được ngay (một bước): vẽ hình chiếu và góc như sách
+        if (bd && !bd.tr && /^(PAR|A|L)$/.test(bd.plan.type)) {
+          const segN = emitDM(grp, xn, pl, mn, bd.plan);
+          const hN = segN && segN.startsWith(xn) ? segN.slice(xn.length) : null;
+          if (hN && known.has(hN)) {
+            const s3 = St(`Suy ra ${oN}${hN} là hình chiếu của ${p}${q} lên ${mn}; góc giữa ${p}${q} và ${mn} là góc ${xn}${oN}${hN}`);
+            seg(s3, O, H, { emph: true });
+            const lab = mark(s3, "arc", O, X, H, greek());
+            grp.steps.push(s3);
+            grp.result = `Góc giữa ${p}${q} và ${mn} = ∠${xn}${oN}${hN}${lab ? " = " + lab : ""}`;
+            return;
+          }
+        }
         if (bd && bd.score < 3.9 && !(bd.plan.type === "C" && !bd.tr)) {
           grp.steps.push(St(`Gọi φ là góc giữa ${p}${q} và ${mn}. Ta có sin φ = d(${xn}, ${mn}) / ${xn}${oN}`));
           emitBest(grp, bd, pl, mn);
@@ -2214,6 +2239,21 @@ const TMAux = (() => {
         const v = sub(Y, X);
         if (len(cross(v, pl.n)) < 1e-7 * len(v) && (isEdgeOrSeg(xn, yn) || proven(xn, yn, pl))) return { type: "L", score: 0.7, X, H, yn };
       }
+      // X nằm trên cạnh YZ (Z ∈ (P)), Y có hình chiếu F trên (P) đã có: chân H thuộc FZ và XH ∥ YF
+      // (như M trung điểm SA, SO ⊥ đáy thì K là trung điểm OA, MK ∥ SO)
+      for (const [yn, Y] of M.pts) {
+        if (yn === xn || /^[a-z]/.test(yn) || onPl(Y, pl)) continue;
+        const F = footPl(Y, pl), fn = nameIn(F);
+        if (!fn || /^[a-z]/.test(fn)) continue;
+        const known1 = proven(yn, fn, pl) || (hasSeg(yn, fn) && (!basePlane || len(cross(pl.n, basePlane.n)) < 1e-9 || !isVert(yn, fn)));
+        if (!known1) continue;
+        for (const [zn, Z] of M.pts) {
+          if (zn === fn || zn === yn || /^[a-z]/.test(zn) || !onPl(Z, pl) || !isEdgeOrSeg(yn, zn) || !onSeg(X, Y, Z)) continue;
+          const t = tOn(X, Y, Z);
+          if (t <= 1e-6 || t >= 1 - 1e-6) continue;
+          return { type: "PAR", score: 0.45 + (Math.abs(t - 0.5) < 1e-9 ? 0 : 0.15), X, H, yn, fn, zn, t };
+        }
+      }
       const lines = linesOn(pl);
       const keyA = (l) => (l[2] ? 1 : 0) + (isVert(l[0], l[1]) ? 0.5 : 0);
       const lineA = lines.filter(([u, w]) => onLine(H, g(u), g(w))).sort((x, y) => keyA(x) - keyA(y))[0];
@@ -2283,6 +2323,18 @@ const TMAux = (() => {
         const Y = other(H, ps.map(([n]) => n));
         if (Y) mark(s, "right", H, X, Y);
         grp.steps.push(s); return xn + hName;
+      }
+      if (plan.type === "PAR") {
+        const { yn, fn, zn, t } = plan;
+        const hN = alloc(H, ["K", "H", "I", "E"]);
+        const mid = Math.abs(t - 0.5) < 1e-9;
+        const txt = isFresh(hN)
+          ? (mid ? `Gọi ${hN} là trung điểm của ${pair(fn, zn)}, ta có ${xn}${hN} ∥ ${pair(yn, fn)} (đường trung bình) nên ${xn}${hN} ⊥ ${mn}`
+            : `Kẻ ${xn}${hN} ∥ ${pair(yn, fn)} (${hN} ∈ ${pair(fn, zn)}), khi đó ${xn}${hN} ⊥ ${mn}`)
+          : `Ta có ${xn}${hN} ∥ ${pair(yn, fn)} nên ${xn}${hN} ⊥ ${mn}`;
+        const s = St(txt);
+        seg(s, g(fn), g(zn)); seg(s, X, H, { emph: true }); mark(s, "right", H, X, g(zn)); pt(s, hN, g(fn), g(zn));
+        grp.steps.push(s); return xn + hN;
       }
       if (plan.type === "L") {
         const hN = alloc(H, ["H", "K", "I"]);
@@ -3250,6 +3302,7 @@ const TMAux = (() => {
       const poly = TM.sectionPolygon(M, sig);
       if (poly.length < 3) return;
       const U = TM.vec.unit;
+      const extendT = (st, X, A, B) => { const t = tOn(X, A, B); if (t < -1e-6) seg(st, A, X, { thin: true }); else if (t > 1 + 1e-6) seg(st, B, X, { thin: true }); };
       const lines2 = (x) => (!Array.isArray(x) ? [] : Array.isArray(x[0]) ? x.filter(Array.isArray) : x.length >= 2 ? [x] : []);
       const quaN = [...new Set([...(Array.isArray(it.qua) ? it.qua : it.qua ? [it.qua] : []), ...(Array.isArray(it.chua) ? it.chua : [])])].filter((n) => known.has(n));
       const ssL = lines2(it.song_song), vgL = lines2(it.vuong_goc)[0], ssM = Array.isArray(it.song_song_mat) ? it.song_song_mat : null, vgM = Array.isArray(it.vuong_goc_mat) ? it.vuong_goc_mat : null;
@@ -3623,7 +3676,7 @@ const TMAux = (() => {
         const xN = addKnown(o.X, ["E", "F", "G", "I", "J", "K", "L", "T"]);
         const s = St(o.v2 ? `Trong ${fname(o.f1)}, kéo dài ${pair(o.v1, o.v2)} cắt ${pair(o.a, o.b)} tại ${xN}`
           : `Trong ${fname(o.f1)}, đường thẳng qua ${o.v1} vừa kẻ cắt ${pair(o.a, o.b)} tại ${xN}`);
-        extend(s, o.X, o.V1, o.V2); extend(s, o.X, o.A, o.B); if (!o.v2) seg(s, o.V1, o.X, { thin: true }); pt(s, xN);
+        extendT(s, o.X, o.V1, o.V2); extendT(s, o.X, o.A, o.B); if (!o.v2) seg(s, o.V1, o.X, { thin: true }); pt(s, xN);
         grp.steps.push(s);
         return true;
       };
@@ -3675,7 +3728,7 @@ const TMAux = (() => {
             }
             const fN = alloc(F, ["I", "F", "J", "E", "G"]);
             const s1 = St(`Trong ${trio(Sx, d2[0], d2[1])}, gọi ${fN} là giao điểm của ${pair(a.n, b.n)} và ${pair(Sx, oN)}`);
-            seg(s1, SP, O, { thin: true }); seg(s1, a.P, b.P, { thin: true }); extend(s1, F, a.P, b.P); pt(s1, fN);
+            seg(s1, SP, O, { thin: true }); seg(s1, a.P, b.P, { thin: true }); extendT(s1, F, a.P, b.P); pt(s1, fN);
             grp.steps.push(s1);
             const ys = hits.map(([e, Y]) => [addKnown(Y, VN), Y, e]);
             const s2 = St(`Trong ${trio(Sx, d1[0], d1[1])}, qua ${fN} kẻ đường thẳng song song với ${dPar.name}, cắt ${ys.map(([, , e]) => pair(e[0], e[1])).join(", ")}${ys.length > 1 ? " lần lượt" : ""} tại ${ys.map(([n]) => n).join(", ")}`);
@@ -3701,7 +3754,7 @@ const TMAux = (() => {
             }
             const fN = alloc(F, ["F", "I", "J", "E", "G"]);
             const s1 = St(`Trong ${trio(Sx, d2[0], d2[1])}, gọi ${fN} là giao điểm của ${pair(a.n, b.n)} và ${pair(Sx, oN)}`);
-            seg(s1, SP, O, { thin: true }); seg(s1, a.P, b.P, { thin: true }); extend(s1, F, a.P, b.P); pt(s1, fN);
+            seg(s1, SP, O, { thin: true }); seg(s1, a.P, b.P, { thin: true }); extendT(s1, F, a.P, b.P); pt(s1, fN);
             grp.steps.push(s1);
             const yN = addKnown(Y, VN);
             const s2 = St(`Trong ${trio(Sx, d1[0], d1[1])}, ${pair(Z.n, fN)} cắt ${pair(e[0], e[1])} tại ${yN}`);
@@ -3759,7 +3812,7 @@ const TMAux = (() => {
         const x1 = nameProj(X, X1), y1 = nameProj(Y, Y1);
         const zN = addKnown(Z, ["E", "F", "G", "I", "J", "T"]);
         const s = St(`Trong ${trio(X.n, Y.n, x1 === X.n ? y1 : x1)}, ${pair(X.n, Y.n)} cắt ${pair(x1, y1)} tại ${zN}`);
-        seg(s, X1, Y1, { thin: true }); extend(s, Z, X.P, Y.P); extend(s, Z, X1, Y1); seg(s, X.P, Y.P, { thin: true }); pt(s, zN);
+        seg(s, X1, Y1, { thin: true }); extendT(s, Z, X.P, Y.P); extendT(s, Z, X1, Y1); seg(s, X.P, Y.P, { thin: true }); pt(s, zN);
         grp.steps.push(s);
         return true;
       };
