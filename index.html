@@ -798,6 +798,8 @@ const TM = (() => {
             let delta = mul(n, h);
             if (it.chan) delta = sub(add(M.get(it.chan), mul(n, h)), bp[0]);
             T.forEach((name, j) => setPt(name, add(bp[j], delta), step));
+            // lăng trụ xiên: vẽ đường cao từ đỉnh trên xuống hình chiếu của nó (như hình trong sách)
+            if (it.chan && it.chan !== B[0]) addSeg(T[0], it.chan, step, "extra");
             if (isIdent(it.chieu_cao) && it.chieu_cao in pv && !locked.has(it.chieu_cao.trim())) {
               T.forEach((name) => M.drag.set(name, { kind: "normal", base: sub(M.get(name), mul(n, h)), n, param: it.chieu_cao.trim() }));
             }
@@ -1092,43 +1094,100 @@ const TM = (() => {
     const conds = Array.isArray(spec.dieu_kien) ? spec.dieu_kien : [];
     const locked = new Set(conds.map((c) => String(c?.tham_so || "").trim()).filter(Boolean));
     const info = [];
+    const items = [];
     for (const c of conds) {
       const p = String(c?.tham_so || "").trim();
       if (!(p in pv)) { info.push({ c, err: `Điều kiện cần tham số "${p}" có trong danh sách tham số` }); continue; }
       let target;
       try { target = evalExpr(c.bang, pv); } catch (e) { info.push({ c, err: e.message }); continue; }
-      const f = (x) => {
-        try {
-          const M = build(spec, { ...pv, [p]: x }, ov, { locked });
-          if (M.errors.length) return NaN;
-          return measure(c, M).v - target;
-        } catch { return NaN; }
-      };
-      const range = Array.isArray(c.khoang) && c.khoang.length === 2 ? c.khoang.map(Number) : null;
-      const N = 120;
-      const xs = [];
-      for (let k = 0; k <= N; k++) {
-        xs.push(range ? range[0] + (range[1] - range[0]) * k / N : Math.pow(10, -3 + (6 * k) / N));
-      }
-      let root = null, prevX = null, prevF = null;
+      items.push({ c, p, target, scale: Math.max(1e-9, Math.abs(target)) });
+    }
+    const resid = (it, vals) => {
+      try {
+        const M = build(spec, vals, ov, { locked });
+        if (M.errors.length) return NaN;
+        return measure(it.c, M).v - it.target;
+      } catch { return NaN; }
+    };
+    // tìm nghiệm một biến: quét (thang log hoặc khoảng cho trước) rồi chia đôi
+    const solve1 = (it, range) => {
+      const f = (x) => resid(it, { ...pv, [it.p]: x });
+      const N = 120, xs = [];
+      for (let k = 0; k <= N; k++) xs.push(range ? range[0] + (range[1] - range[0]) * k / N : Math.pow(10, -3 + (6 * k) / N));
+      let prevX = null, prevF = null;
       for (const x of xs) {
         const fx = f(x);
         if (!isFinite(fx)) { prevX = null; continue; }
-        if (Math.abs(fx) < 1e-12) { root = x; break; }
+        if (Math.abs(fx) < 1e-12 * it.scale) return x;
         if (prevX != null && Math.sign(fx) !== Math.sign(prevF)) {
           let lo = prevX, hi = x, flo = prevF;
-          for (let it = 0; it < 80; it++) {
+          for (let i = 0; i < 80; i++) {
             const mid = (lo + hi) / 2, fm = f(mid);
             if (!isFinite(fm)) break;
             if (Math.sign(fm) === Math.sign(flo)) { lo = mid; flo = fm; } else hi = mid;
           }
-          root = (lo + hi) / 2;
-          break;
+          return (lo + hi) / 2;
         }
         prevX = x; prevF = fx;
       }
-      if (root == null) info.push({ c, err: `Không tìm được giá trị ${p} thỏa điều kiện` });
-      else { pv[p] = root; info.push({ c, p, value: root }); }
+      return null;
+    };
+    const rangeOf = (it) => (Array.isArray(it.c.khoang) && it.c.khoang.length === 2 ? it.c.khoang.map(Number) : null);
+    const roots = new Map();
+    // vòng 1 như trước; có nhiều điều kiện ràng buộc lẫn nhau thì lặp thêm vài vòng (Gauss–Seidel)
+    const rounds = items.length > 1 ? 4 : 1;
+    for (let r = 0; r < rounds; r++) {
+      let moved = 0;
+      for (const it of items) {
+        const old = pv[it.p];
+        const x = r === 0 ? solve1(it, rangeOf(it)) : (solve1(it, [old * 0.5, old * 2]) ?? solve1(it, rangeOf(it)));
+        if (x != null) { pv[it.p] = x; roots.set(it, x); moved = Math.max(moved, Math.abs(x - old) / Math.max(Math.abs(old), 1e-9)); }
+      }
+      if (r > 0 && moved < 1e-13) break;
+    }
+    // giải đồng thời bằng Newton khi các điều kiện phụ thuộc nhau
+    const uniq = new Set(items.map((it) => it.p)).size === items.length;
+    const F = (vals) => items.map((it) => resid(it, vals) / it.scale);
+    const norm = (v) => Math.max(...v.map((x) => (isFinite(x) ? Math.abs(x) : Infinity)));
+    if (items.length > 1 && uniq) {
+      let x = items.map((it) => pv[it.p]);
+      const valsOf = (xv) => ({ ...pv, ...Object.fromEntries(items.map((it, i) => [it.p, xv[i]])) });
+      let Fx = F(valsOf(x));
+      for (let iter = 0; iter < 40 && norm(Fx) > 1e-13; iter++) {
+        const n = items.length, J = [];
+        for (let j = 0; j < n; j++) {
+          const h = 1e-6 * Math.max(Math.abs(x[j]), 1e-3);
+          const xh = x.slice(); xh[j] += h;
+          const Fh = F(valsOf(xh));
+          for (let i = 0; i < n; i++) { J[i] = J[i] || []; J[i][j] = (Fh[i] - Fx[i]) / h; }
+        }
+        // khử Gauss
+        const A = J.map((row, i) => [...row, -Fx[i]]);
+        let ok = true;
+        for (let c = 0; c < n && ok; c++) {
+          let piv = c;
+          for (let r2 = c + 1; r2 < n; r2++) if (Math.abs(A[r2][c]) > Math.abs(A[piv][c])) piv = r2;
+          if (!isFinite(A[piv][c]) || Math.abs(A[piv][c]) < 1e-14) { ok = false; break; }
+          [A[c], A[piv]] = [A[piv], A[c]];
+          for (let r2 = 0; r2 < n; r2++) if (r2 !== c) { const k = A[r2][c] / A[c][c]; for (let q = c; q <= n; q++) A[r2][q] -= k * A[c][q]; }
+        }
+        if (!ok) break;
+        const dx = A.map((row, i) => row[n] / row[i]);
+        let t = 1, improved = false;
+        for (let ls = 0; ls < 30; ls++, t /= 2) {
+          const xn = x.map((v, i) => v + t * dx[i]);
+          if (xn.some((v) => !(v > 0))) continue;
+          const Fn = F(valsOf(xn));
+          if (norm(Fn) < norm(Fx)) { x = xn; Fx = Fn; improved = true; break; }
+        }
+        if (!improved) break;
+      }
+      if (norm(Fx) < 1e-9) items.forEach((it, i) => { pv[it.p] = x[i]; roots.set(it, x[i]); });
+    }
+    for (const it of items) {
+      const ok = roots.has(it) && Math.abs(resid(it, pv)) < 1e-7 * it.scale;
+      if (!ok) info.push({ c: it.c, err: `Không tìm được giá trị ${it.p} thỏa điều kiện` });
+      else info.push({ c: it.c, p: it.p, value: pv[it.p] });
     }
     return { pv, info, locked };
   }
@@ -1358,7 +1417,8 @@ const TM = (() => {
     if (Math.abs(r - deg) < 1e-7 && (Number.isInteger(r / 15) || Number.isInteger(r / 18) || r === 90)) return `${r}°`;
     const c = Math.cos(deg * DEG), t = Math.tan(deg * DEG);
     const ec = exact(c), et = Math.abs(deg - 90) > 1e-6 ? exact(t) : null;
-    if (ec) return `cos = ${ec}`;
+    // tan là số hữu tỉ (như arctan 2 trong sách) thì ghi thêm
+    if (ec) return et && !et.includes("√") && ec.includes("√") ? `cos = ${ec}, tan = ${et}` : `cos = ${ec}`;
     if (et) return `tan = ${et}`;
     const es = exact(Math.sin(deg * DEG));
     return es ? `sin = ${es}` : null;
@@ -1432,6 +1492,14 @@ const TMAux = (() => {
     const covered = (A, B) => segList.some(([P, Q]) => onSeg(A, P, Q) && onSeg(B, P, Q));
     const namedSegs = M.segs.filter((s) => s.a).map((s) => [s.a, s.b]);
     const hasSeg = (a, b) => namedSegs.some(([p, q]) => (p === a && q === b) || (p === b && q === a));
+    // các đường vuông góc mặt phẳng đã được chứng minh trong đề (câu chứng minh XY ⊥ (P))
+    const proven = (x, y, pl) => (Array.isArray(spec?.so_do) ? spec.so_do : []).some((c) => {
+      if (!c || c.loai !== "vuong_goc" || !Array.isArray(c.duong) || !Array.isArray(c.mat)) return false;
+      const [p0, q0] = c.duong;
+      if (!((p0 === x && q0 === y) || (p0 === y && q0 === x))) return false;
+      try { const pp = TM.planeOf(M, c.mat); return len(cross(pp.n, pl.n)) < 1e-7 && Math.abs(dot(sub(pp.o, pl.o), pl.n)) < 1e-6 * R; } catch { return false; }
+    });
+    const isEdgeOrSeg = (x, y) => hasSeg(x, y) || !!M.solid?.edges.some(([e1, e2]) => (e1 === x && e2 === y) || (e1 === y && e2 === x));
     const sameDir = (P, T, Q, T2) => {
       const u = sub(P, T), v = sub(Q, T2);
       const lu = len(u), lv = len(v);
@@ -1630,9 +1698,11 @@ const TMAux = (() => {
           if (!onPl(X, A) || onD(X)) continue;
           const Xp = footPl(X, B), K = footLn(X, L.L0, L1);
           if (same(Xp, K) || far(Xp) || far(K)) continue;
-          // hình chiếu Xp chưa có tên thì phải tính thêm khoảng cách XXp, khó hơn
-          const score = (nameIn(Xp) ? 0 : 1.6) + (nameIn(K) ? 0 : 1) + (xn === apex ? -0.3 : 0) + (an === n1 ? 0 : 0.05);
-          if (!best || score < best.score - 1e-9) best = { score, xn, X, Xp, K, an, bn };
+          // hình chiếu Xp chưa có tên thì phải tính thêm khoảng cách XXp, khó hơn – trừ khi dựng được như d(X, (B)) (Xp trên một đường có sẵn)
+          const q = nameIn(Xp) ? null : planDM(xn, B);
+          const xpCost = nameIn(Xp) ? 0 : q && q.type === "A" ? 0.8 : 1.6;
+          const score = xpCost + (nameIn(K) ? 0 : 1) + (xn === apex ? -0.3 : 0) + (an === n1 ? 0 : 0.05);
+          if (!best || score < best.score - 1e-9) best = { score, xn, X, Xp, K, an, bn, B, q: q && q.type === "A" ? q : null };
         }
       }
       const dPt = L.U && L.V ? (P) => (same(P, L.U) ? L.V : L.U) : (P) => add(P, mul(L.d, 0.4 * R));
@@ -1696,7 +1766,40 @@ const TMAux = (() => {
         const sc = 0.3 + q1.score + q2.score + (xn === apex ? 0.3 : 0);
         if (!nor || sc < nor.sc) nor = { sc, xn, X, q1, q2 };
       }
-      if (nor && nor.sc < Math.min(best ? best.score : Infinity, sym ? sym.sc : Infinity)) {
+      // phải dựng thêm giao tuyến thì cách dựng góc theo định nghĩa dài hơn
+      const lineCost = L.steps.length ? 0.8 : 0;
+      // cách dùng diện tích hình chiếu: S' = S·cos φ (khi hình chiếu các đỉnh của một tam giác đều là điểm có tên)
+      let proj = null;
+      for (const [P1, P2, m1, m2] of [[L.p1, L.p2, n1, n2], [L.p2, L.p1, n2, n1]]) {
+        const cand = [...M.pts].filter(([n, X]) => !/^[a-z]/.test(n) && onPl(X, P2)).map(([n, X]) => {
+          const fn = onPl(X, P1) ? n : nameIn(footPl(X, P1));
+          return fn ? { n, X, fn, F: g(fn) } : null;
+        }).filter(Boolean);
+        for (let i = 0; i < cand.length; i++) for (let j = i + 1; j < cand.length; j++) for (let k = j + 1; k < cand.length; k++) {
+          const T = [cand[i], cand[j], cand[k]];
+          const a0 = len(cross(sub(T[1].X, T[0].X), sub(T[2].X, T[0].X))), a1 = len(cross(sub(T[1].F, T[0].F), sub(T[2].F, T[0].F)));
+          if (a0 < 1e-6 * R * R || a1 < 1e-6 * R * R || T.every((t) => t.n === t.fn)) continue;
+          const sc = 1.2 - 1e-3 * a0 / (R * R);
+          if (!proj || sc < proj.sc) proj = { sc, T, m1, m2 };
+        }
+      }
+      if (proj && proj.sc < Math.min(best ? best.score + lineCost : Infinity, sym ? sym.sc + lineCost : Infinity, nor ? nor.sc : Infinity)) {
+        grp.steps.splice(nL, L.steps.length);
+        const { T, m1, m2 } = proj;
+        const moved = T.filter((t) => t.n !== t.fn);
+        const tri = T.map((t) => t.n).join(""), pro = T.map((t) => t.fn).join("");
+        const s1 = St(`Hình chiếu vuông góc của ${moved.map((t) => t.n).join(", ")} lên ${m1} ${moved.length > 1 ? "lần lượt " : ""}là ${moved.map((t) => t.fn).join(", ")}, nên tam giác ${pro} là hình chiếu vuông góc của tam giác ${tri} lên ${m1}`);
+        for (const t of moved) { seg(s1, t.X, t.F, { thin: true }); const Y = T.find((o) => o !== t); if (Y) mark(s1, "right", t.F, t.X, Y.F); }
+        s1.polys.push({ pts: T.map((t) => t.X) });
+        grp.steps.push(s1);
+        const s2 = St(`Gọi φ là góc giữa ${n1} và ${n2}. Ta có S(${pro}) = S(${tri})·cos φ nên cos φ = S(${pro}) / S(${tri})`);
+        s2.polys.push({ pts: T.map((t) => t.F) });
+        grp.steps.push(s2);
+        grp.result = `cos φ = S(${pro}) / S(${tri})`;
+        grp.projArea = { tri: T.map((t) => t.n), pro: T.map((t) => t.fn) };
+        return;
+      }
+      if (nor && nor.sc < Math.min(best ? best.score + lineCost : Infinity, sym ? sym.sc + lineCost : Infinity)) {
         grp.steps.splice(nL, L.steps.length);
         const { xn, X, q1, q2 } = nor;
         emitDM(grp, xn, L.p1, n1, q1);
@@ -1751,9 +1854,15 @@ const TMAux = (() => {
       const { xn, X, Xp, K, an, bn } = best;
       drawLine();
       const dn = L.name;
-      const xpN = alloc(Xp, ["H", "K"]);
-      const s1 = St(isFresh(xpN) ? `Gọi ${xpN} là hình chiếu vuông góc của ${xn} lên ${bn}` : `Hình chiếu vuông góc của ${xn} lên ${bn} là ${xpN}`);
-      seg(s1, X, Xp); mark(s1, "right", Xp, X, K); pt(s1, xpN); grp.steps.push(s1);
+      let xpN;
+      if (best.q) {
+        const sgn = emitDM(grp, xn, best.B, bn, best.q);
+        xpN = sgn.slice(xn.length);
+      } else {
+        xpN = alloc(Xp, ["H", "K"]);
+        const s1 = St(isFresh(xpN) ? `Gọi ${xpN} là hình chiếu vuông góc của ${xn} lên ${bn}` : `Hình chiếu vuông góc của ${xn} lên ${bn} là ${xpN}`);
+        seg(s1, X, Xp); mark(s1, "right", Xp, X, K); pt(s1, xpN); grp.steps.push(s1);
+      }
       const kN = alloc(K, ["H", "K", "I", "E"]);
       const s2 = St(isFresh(kN) ? `Kẻ ${xpN}${kN} ⊥ ${dn} tại ${kN}` : `Ta có ${xpN}${kN} ⊥ ${dn}`);
       seg(s2, Xp, K); mark(s2, "right", K, Xp, dPt(K)); pt(s2, kN, L.U && L.V ? L.U : null, L.U && L.V ? L.V : null);
@@ -1811,6 +1920,41 @@ const TMAux = (() => {
           }
         }
       }
+      // qua một đầu mút kẻ đường song song với đường kia, cắt một cạnh có sẵn (như sách: DM ∥ BC với M ∈ AB)
+      {
+        const edgesAll = [...(M.solid ? M.solid.edges : []), ...namedSegs];
+        let bestP = null;
+        for (const [[x1, x2], [y1, y2]] of [[[a, b], [p, q]], [[b, a], [p, q]], [[p, q], [a, b]], [[q, p], [a, b]]]) {
+          const X = g(x1), d = sub(g(y2), g(y1));
+          for (const [e1, e2] of edgesAll) {
+            if (e1 === x1 || e2 === x1) continue;
+            const U = g(e1), W = g(e2), w = sub(W, U), nn = cross(d, w);
+            if (len(nn) < 1e-9 * len(d) * len(w) || Math.abs(dot(sub(U, X), nn)) / len(nn) > tolP) continue;
+            const wd = cross(w, d), sP = dot(cross(sub(X, U), d), wd) / dot(wd, wd);
+            const inside = sP > 1e-6 && sP < 1 - 1e-6;
+            const Y = add(U, mul(w, sP));
+            if (!inside && (sP < -1.05 || sP > 2.05 || far(Y) || Math.abs(sP) < 1e-6 || Math.abs(sP - 1) < 1e-6)) continue;
+            if (same(Y, X) || onLine(Y, g(x1), g(x2))) continue;
+            const yn0 = nameIn(Y);
+            const sc = (yn0 ? 0 : 1) + (Math.abs(sP - 0.5) < 1e-6 ? -0.3 : 0) + (x1 === a || x1 === b ? 0 : 0.05) + (inside ? 0 : 0.6);
+            if (!bestP || sc < bestP.sc) bestP = { sc, x1, x2, y1, y2, e1, e2, Y, sP, inside };
+          }
+        }
+        if (bestP) {
+          const { x1, x2, y1, y2, e1, e2, Y, sP } = bestP, X = g(x1);
+          const yN = alloc(Y, ["M", "N", "E", "F", "K"]);
+          const ue = pair(e1, e2), py = pair(y1, y2);
+          const txt = !isFresh(yN) || !grpFresh.has(yN) ? `Ta có ${x1}${yN} ∥ ${py}`
+            : Math.abs(sP - 0.5) < 1e-6 ? `Gọi ${yN} là trung điểm ${ue}, ta có ${x1}${yN} ∥ ${py}` : `Qua ${x1} kẻ đường thẳng song song với ${py}, cắt ${bestP.inside ? ue : "đường thẳng " + ue} tại ${yN}`;
+          const s = St(`${txt}. Góc giữa ${a}${b} và ${p}${q} bằng góc giữa ${pair(x1, x2)} và ${x1}${yN}`);
+          seg(s, X, Y, { emph: true }); pt(s, yN);
+          if (!bestP.inside) extend(s, Y, g(e1), g(e2));
+          const lab = acuteArc(s, X, X, g(x2), X, Y);
+          grp.steps.push(s);
+          grp.result = `Góc giữa ${a}${b} và ${p}${q} = góc giữa ${pair(x1, x2)} và ${x1}${yN}${lab ? " = " + lab : ""}`;
+          return;
+        }
+      }
       // qua một đầu mút kẻ đường song song
       const E = add(A, dot(u, v) >= 0 ? v : mul(v, -1));
       const eN = alloc(E, ["E", "F"]);
@@ -1829,6 +1973,12 @@ const TMAux = (() => {
       if (far(H)) return null;
       const hName = nameIn(H);
       if (hName && hasSeg(xn, hName)) return { type: "direct", score: 0, X, H };
+      // đường XY có sẵn (cạnh, đoạn, đường chéo) vuông góc với mặt phẳng: chân H = XY ∩ (P)
+      for (const [yn, Y] of M.pts) {
+        if (yn === xn || /^[a-z]/.test(yn)) continue;
+        const v = sub(Y, X);
+        if (len(cross(v, pl.n)) < 1e-7 * len(v) && (isEdgeOrSeg(xn, yn) || proven(xn, yn, pl))) return { type: "L", score: 0.7, X, H, yn };
+      }
       const lines = linesOn(pl);
       const keyA = (l) => (l[2] ? 1 : 0) + (isVert(l[0], l[1]) ? 0.5 : 0);
       const lineA = lines.filter(([u, w]) => onLine(H, g(u), g(w))).sort((x, y) => keyA(x) - keyA(y))[0];
@@ -1844,11 +1994,13 @@ const TMAux = (() => {
           const t = tOn(H, V, K);
           const perpEdge = hasSeg(xn, vn) || M.solid?.edges.some(([e1, e2]) => (e1 === xn && e2 === vn) || (e1 === vn && e2 === xn));
           const vertXV = basePlane && len(cross(sub(V, X), basePlane.n)) < 1e-6 * len(sub(V, X));
-          const goodV = vn === apex || vertXV || (perpEdge && Math.abs(dot(sub(V, X), sub(W, U))) < 1e-6 * len(sub(V, X)) * len(sub(W, U)));
+          const byEdge = perpEdge && Math.abs(dot(sub(V, X), sub(W, U))) < 1e-6 * len(sub(V, X)) * len(sub(W, U));
+          const goodV = vn === apex || vertXV || byEdge;
           const inBase = basePlane && onPl(U, basePlane) && onPl(W, basePlane);
-          const score = 1 + (nameIn(K) ? 0 : 1) + (virt ? 0.6 : 0) + (onSeg(K, U, W) ? 0 : 0.3) + (goodV ? 0 : 1.5) + (inBase ? -0.1 : 0)
+          // chỉ dựa vào "cạnh XV ⊥ UW" (không phải đỉnh hay đường thẳng đứng) thì khó giải thích hơn
+          const score = 1 + (nameIn(K) ? 0 : 1) + (virt ? 0.6 : 0) + (onSeg(K, U, W) ? 0 : 0.3) + (goodV ? (vn === apex || vertXV ? 0 : 0.8) : 1.5) + (inBase ? -0.1 : 0)
             + (t > -1e-6 && t < 1 + 1e-6 ? 0 : 0.4);
-          if (!best || score < best.score - 1e-9) best = { type: "B", score, X, H, u, w, U, W, K, vn, V };
+          if (!best || score < best.score - 1e-9) best = { type: "B", score, X, H, u, w, U, W, K, vn, V, weak: !(vn === apex || vertXV) };
         }
       }
       // B2: mặt phẳng (Q) qua X vuông góc với một đường uw của (P) thì (Q) ⊥ (P); kẻ XH ⊥ giao tuyến KV
@@ -1896,6 +2048,12 @@ const TMAux = (() => {
         const Y = other(H, ps.map(([n]) => n));
         if (Y) mark(s, "right", H, X, Y);
         grp.steps.push(s); return xn + hName;
+      }
+      if (plan.type === "L") {
+        const hN = alloc(H, ["H", "K", "I"]);
+        const s = St(`Vì ${pair(xn, plan.yn)} ⊥ ${mn} nên ${isFresh(hN) ? "gọi " + hN + " là giao điểm của " + pair(xn, plan.yn) + " và " + mn + " thì " : ""}${xn}${hN} ⊥ ${mn}`);
+        seg(s, X, H, { emph: true }); const Y = other(H, ptsOn(pl).map(([n]) => n)); if (Y) mark(s, "right", H, X, Y); pt(s, hN);
+        grp.steps.push(s); return xn + hN;
       }
       if (plan.type === "A") {
         const { u, w } = plan;
@@ -2003,6 +2161,7 @@ const TMAux = (() => {
         } else {
           const I = add(X, mul(v, -sd(X, pl) / den));
           let iN = nameIn(I), extra = 0, line = null;
+          if (iN && /^[a-z]/.test(iN)) iN = null; // điểm cuối tia (x, y) không dùng làm giao điểm
           if (!iN) {
             // giao điểm chưa có tên: chỉ dùng khi nó nằm trên một đường có sẵn của mặt phẳng
             line = realLines.find(([a1, b1]) => onLine(I, g(a1), g(b1)));
@@ -2046,10 +2205,35 @@ const TMAux = (() => {
       const rs = frac(f);
       grp.result = `d(${best.xn}, ${mn}) = ${rs === "1" ? "" : rs + "·"}${sgm}`;
     }
-    function diemMat(grp, xn, pl, mn, lead) {
+    function diemMat(grp, xn, pl, mn, lead, matNames) {
       let best = bestDM(xn, pl, mn);
       // chưa có cách dựng gọn: cho phép đổi điểm thêm một lần nữa
       if (best && best.score >= 3.9) { const b3 = bestDM(xn, pl, mn, 3); if (b3 && b3.score < best.score) best = b3; }
+      // phương pháp thể tích: d(X, (PQR)) = 3V(X.PQR) / S(PQR) khi thể tích dễ tính hơn dựng chân đường vuông góc
+      if (Array.isArray(matNames) && matNames.length === 3 && matNames.every((n) => M.pts.has(n)) && !matNames.includes(xn)) {
+        // chỉ dùng khi cách dựng trực tiếp phải dùng mặt phẳng phụ (B2) hoặc quá dài
+        let tail = best;
+        while (tail && tail.tr) tail = tail.tr.py;
+        const weak = !best || /^(B2|C)$/.test(tail?.plan?.type) || tail?.plan?.weak || best.score >= 5.5;
+        const vp = weak ? bestVol(xn, matNames) : null;
+        const vs = vp ? 2.6 + vp.score : Infinity;
+        if (vp && vs < (best ? best.score : Infinity)) {
+          if (lead) grp.steps.push(St(lead));
+          const T = matNames.join("");
+          grp.steps.push(St(`Dùng thể tích: d(${xn}, ${mn}) = 3·V(${xn}.${T}) / S(${T})`));
+          emitVol(grp, vp);
+          const P = matNames.map(g);
+          const ri = [0, 1, 2].find((i) => Math.abs(dot(sub(P[(i + 1) % 3], P[i]), sub(P[(i + 2) % 3], P[i]))) < 1e-7 * len(sub(P[(i + 1) % 3], P[i])) * len(sub(P[(i + 2) % 3], P[i])));
+          const sA = St(ri != null ? `Tam giác ${T} vuông tại ${matNames[ri]} nên S(${T}) = ½·${pair(matNames[ri], matNames[(ri + 1) % 3])}·${pair(matNames[ri], matNames[(ri + 2) % 3])}`
+            : `Tính S(${T}) từ ba cạnh ${pair(matNames[0], matNames[1])}, ${pair(matNames[1], matNames[2])}, ${pair(matNames[2], matNames[0])}`);
+          sA.polys.push({ pts: P });
+          if (ri != null) mark(sA, "right", P[ri], P[(ri + 1) % 3], P[(ri + 2) % 3]);
+          grp.steps.push(sA);
+          grp.result = `d(${xn}, ${mn}) = 3·V(${xn}.${T}) / S(${T})`;
+          grp.volMethod = { tri: matNames, xn };
+          return;
+        }
+      }
       if (!best) throw new Error("hình chiếu quá xa");
       if (lead) grp.steps.push(St(lead));
       emitBest(grp, best, pl, mn);
@@ -2347,7 +2531,19 @@ const TMAux = (() => {
       if (Math.abs(Math.abs(den) / len(u) - 1) > 1e-6) { grp.result = `Trên hình dựng, ${pair(p, q)} không vuông góc với ${pn}. Hãy kiểm tra lại đề`; return false; }
       const O = add(P, mul(u, -sd(P, pl) / den));
       const edges = (M.solid ? M.solid.edges : []).filter(([a, b]) => onPl(g(a), pl) && onPl(g(b), pl)).map(([a, b]) => [a, b, false]);
-      const all = [...edges, ...linesOn(pl)];
+      let all = [...edges, ...linesOn(pl)];
+      // giao điểm của PQ với mặt phẳng chưa có tên nhưng nằm trên một đường có sẵn (ví dụ K = SN ∩ EF): đặt tên để dùng các đường qua K
+      let oStep = null;
+      if (!nameIn(O) && !far(O)) {
+        const host = all.find(([a, b]) => onSeg(O, g(a), g(b)));
+        if (host) {
+          const oN = alloc(O, ["K", "I", "H", "E"]);
+          oStep = St(`Gọi ${oN} là giao điểm của ${pair(p, q)} và ${pair(host[0], host[1])}`);
+          pt(oStep, oN);
+          all = [...all, ...ptsOn(pl).filter(([n]) => n !== oN && !/^[a-z]/.test(n) && !onLine(g(n), g(host[0]), g(host[1]))).map(([n]) => [oN, n, true])];
+        }
+      }
+      if (oStep) grp.steps.push(oStep);
       const through = (l) => onLine(O, g(l[0]), g(l[1]));
       const rk = (l) => rank(l[0]) + rank(l[1]);
       const nonPar = (l, m) => len(cross(sub(g(m[1]), g(m[0])), sub(g(l[1]), g(l[0])))) > 1e-6 * len(sub(g(m[1]), g(m[0]))) * len(sub(g(l[1]), g(l[0])));
@@ -2385,7 +2581,33 @@ const TMAux = (() => {
         if (perp) { if (lineVsPlane(grp, p, q, pl, pn)) grp.result = `${pair(p, q)} ⊥ ${pn}`; return; }
         const u = sub(g(q), g(p));
         const l = linesIn(pl).sort((x, y) => (x[2] ? 1 : 0) - (y[2] ? 1 : 0)).find(([a, b]) => par(sub(g(b), g(a)), u));
-        if (!l) { grp.result = `Chưa tìm được đường thẳng có sẵn trong ${pn} song song với ${pair(p, q)}`; return; }
+        if (!l) {
+          // dựng: qua một điểm X của mặt phẳng kẻ XY ∥ PQ, Y trên một cạnh của khối nằm trong mặt phẳng (thường là trung điểm)
+          const edgesP = [...(M.solid ? M.solid.edges : []), ...namedSegs].filter(([e1, e2]) => onPl(g(e1), pl) && onPl(g(e2), pl))
+            .concat(linesOn(pl).filter((l) => l[2]).map(([e1, e2]) => [e1, e2]));
+          let bp = null;
+          for (const [xn, X] of ptsOn(pl)) {
+            if (/^[a-z]/.test(xn)) continue;
+            for (const [e1, e2] of edgesP) {
+              if (e1 === xn || e2 === xn) continue;
+              const U = g(e1), w = sub(g(e2), U), wd = cross(w, u);
+              if (len(wd) < 1e-9 * len(w) * len(u)) continue;
+              const t = dot(cross(sub(X, U), u), wd) / dot(wd, wd);
+              if (t < 1e-6 || t > 1 - 1e-6) continue;
+              const Y = add(U, mul(w, t));
+              if (same(Y, X)) continue;
+              const sc = (nameIn(Y) ? 0 : 1) + (Math.abs(t - 0.5) < 1e-6 ? -0.3 : 0);
+              if (!bp || sc < bp.sc) bp = { sc, xn, X, e1, e2, Y, t };
+            }
+          }
+          if (!bp) { grp.result = `Chưa tìm được đường thẳng có sẵn trong ${pn} song song với ${pair(p, q)}`; return; }
+          const yN = alloc(bp.Y, ["I", "E", "K", "F"]);
+          const ue = pair(bp.e1, bp.e2);
+          const s = St(`${Math.abs(bp.t - 0.5) < 1e-6 && isFresh(yN) ? "Gọi " + yN + " là trung điểm " + ue + ", ta có " + bp.xn + yN + " ∥ " + pair(p, q) : "Lấy " + yN + " trên " + ue + " sao cho " + bp.xn + yN + " ∥ " + pair(p, q)}. Mà ${bp.xn}${yN} ⊂ ${pn} nên ${pair(p, q)} ∥ ${pn}`);
+          seg(s, g(p), g(q), { emph: true }); seg(s, bp.X, bp.Y, { emph: true }); pt(s, yN);
+          grp.steps.push(s); grp.result = `${pair(p, q)} ∥ ${pn}`;
+          return;
+        }
         const s = St(`${pair(p, q)} ∥ ${pair(l[0], l[1])} mà ${pair(l[0], l[1])} ⊂ ${pn} nên ${pair(p, q)} ∥ ${pn}`);
         seg(s, g(p), g(q), { emph: true }); seg(s, g(l[0]), g(l[1]), { emph: true });
         grp.steps.push(s); grp.result = `${pair(p, q)} ∥ ${pn}`;
@@ -2493,34 +2715,143 @@ const TMAux = (() => {
       return out2;
     }
 
-    function theTich(grp, c) {
-      if (c && c.dinh && Array.isArray(c.day) && c.day.length >= 3) {
-        const pl = plane(c.day.slice(0, 3)), bn = "(" + c.day.join("") + ")";
-        const X = g(c.dinh), H = footPl(X, pl);
-        // X nằm trên đoạn VU với VW ⊥ đáy (W, U trong đáy): kẻ XF ∥ VW, F ∈ WU (như cách làm trong sách)
-        let par = null;
-        if (!nameIn(H)) {
-          for (const [vn, V] of M.pts) for (const [wn, W] of M.pts) {
-            if (par || vn === wn || onPl(V, pl) || !onPl(W, pl) || len(cross(sub(V, W), pl.n)) > 1e-6 * len(sub(V, W))) continue;
-            if (!(hasSeg(vn, wn) || M.solid?.edges.some(([e1, e2]) => (e1 === vn && e2 === wn) || (e1 === wn && e2 === vn)))) continue;
-            for (const [un, U] of M.pts) {
-              if (un === wn || !onPl(U, pl) || !onSeg(X, V, U) || same(X, V) || same(X, U)) continue;
-              if (onSeg(H, W, U)) { par = { vn, wn, un }; break; }
+    // ---------- thể tích khối chóp con, tứ diện: chọn đỉnh và đường cao dễ tính như sách ----------
+    // cách tính chiều cao từ đỉnh xn xuống mặt phẳng chứa đáy
+    function heightPlan(xn, base) {
+      let pl;
+      try { pl = plane(base.slice(0, 3)); } catch { return null; }
+      const X = g(xn);
+      if (onPl(X, pl)) return null;
+      const H = footPl(X, pl), hn = nameIn(H);
+      if (hn) return { score: 0, kind: "named", xn, base, pl, H, hn };
+      // hai mặt phẳng song song của khối (đáy dưới và đáy trên của lăng trụ, hình hộp)
+      const faces = (M.solid ? M.solid.faces : []).map((f) => { try { return { f, p: TM.planeOf(M, f.names.slice(0, 3)) }; } catch { return null; } }).filter(Boolean);
+      const fx = faces.find(({ p }) => onPl(X, p) && len(cross(p.n, pl.n)) < 1e-9);
+      if (fx) {
+        const e = (M.solid ? M.solid.edges : []).find(([e1, e2]) => (onPl(g(e1), fx.p) && onPl(g(e2), pl) || onPl(g(e2), fx.p) && onPl(g(e1), pl)) && len(cross(sub(g(e2), g(e1)), pl.n)) < 1e-6 * len(sub(g(e2), g(e1))));
+        if (e) return { score: 0.2, kind: "planes", xn, base, pl, H, face: fx.f, edge: e };
+      }
+      // trong mặt phẳng (VWU) với VW ⊥ (đáy): kẻ XH ∥ VW, H ∈ WU
+      for (const [vn, V] of M.pts) for (const [wn, W] of M.pts) {
+        if (vn === wn || onPl(V, pl) || !onPl(W, pl) || len(cross(sub(V, W), pl.n)) > 1e-6 * len(sub(V, W)) || !isEdgeOrSeg(vn, wn)) continue;
+        for (const [un, U] of M.pts) {
+          if (un === wn || !onPl(U, pl) || same(X, V) || same(X, U) || /^[a-z]/.test(un)) continue;
+          let pv;
+          try { pv = plane([vn, wn, un]); } catch { continue; }
+          if (!onPl(X, pv) || !onSeg(H, W, U) || same(H, W) || same(H, U)) continue;
+          return { score: onSeg(X, V, U) ? 0.3 : 0.45, kind: "par", xn, base, pl, H, vn, wn, un, onVU: onSeg(X, V, U) };
+        }
+      }
+      const q = planDM(xn, pl);
+      if (q && /^(A|B|L)$/.test(q.type)) return { score: (q.type === "L" ? 0.3 : 1) + q.score + (q.weak ? 1 : 0), kind: "dm", xn, base, pl, H, q };
+      return { score: 3, kind: "proj", xn, base, pl, H };
+    }
+    // V(apex.base): thử đổi vai trò đỉnh (tứ diện) và đổi đỉnh theo tỉ số (V(X.F) = r·V(Y.F) khi XY cắt (F) tại I)
+    function bestVol(apex, base, allowSwap = true) {
+      const opts = [];
+      const hp0 = heightPlan(apex, base);
+      if (hp0) opts.push({ ...hp0, score: hp0.score, relabel: null });
+      if (base.length === 3) {
+        const all = [apex, ...base];
+        for (const t of base) {
+          const rest = all.filter((n) => n !== t);
+          const hp = heightPlan(t, rest);
+          if (hp) opts.push({ ...hp, score: hp.score + 0.15, relabel: { from: [apex, base], to: [t, rest] } });
+        }
+      }
+      let best = opts.sort((x, y) => x.score - y.score)[0] || null;
+      if (allowSwap && (!best || best.score > 0.5)) {
+        let pl;
+        try { pl = plane(base.slice(0, 3)); } catch { pl = null; }
+        if (pl) {
+          const X = g(apex);
+          const lines = linesOn(pl).sort((x, y) => (x[2] ? 1 : 0) - (y[2] ? 1 : 0));
+          for (const [yn, Y] of M.pts) {
+            if (yn === apex || base.includes(yn) || /^[a-z]/.test(yn) || onPl(Y, pl)) continue;
+            const v = sub(Y, X), den = dot(pl.n, v);
+            if (Math.abs(den) < 1e-9 * len(v)) {
+              // XY ∥ (đáy): V(X.F) = V(Y.F) – XY là cạnh, đoạn có sẵn hoặc song song với một đường của mặt phẳng
+              const parL = lines.find(([a1, b1, vt]) => !vt && len(cross(sub(g(b1), g(a1)), v)) < 1e-6 * len(v) * len(sub(g(b1), g(a1))));
+              if (!(isEdgeOrSeg(apex, yn) || parL)) continue;
+              const inner = bestVol(yn, base, false);
+              if (!inner) continue;
+              const sc = inner.score + 0.6;
+              if (!best || sc < best.score) best = { ...inner, score: sc, swap: { apex, yn, par: parL || [apex, yn], r: 1, base } };
+              continue;
             }
+            const I = add(X, mul(v, -sd(X, pl) / den));
+            if (far(I)) continue;
+            const iN = nameIn(I);
+            const line = iN ? null : lines.find(([a1, b1]) => onSeg(I, g(a1), g(b1)));
+            if (!iN && !line) continue;
+            const r = len(sub(X, I)) / len(sub(Y, I));
+            const inner = bestVol(yn, base, false);
+            if (!inner) continue;
+            const sc = inner.score + 0.8 + (iN ? 0 : 0.4 + (line[2] ? 0.2 : 0)) + (Math.abs(r - 1) < 1e-9 ? 0 : 0.2);
+            if (!best || sc < best.score) best = { ...inner, score: sc, swap: { apex, yn, I, iN, line, r, base } };
           }
         }
-        const hN = alloc(H, par ? ["E", "F", "I", "K", "H"] : ["H", "O"]);
-        const s0 = St(`Đáy ${c.day.join("")}`);
-        s0.polys.push({ pts: c.day.map(g) });
-        for (let i = 0; i < c.day.length; i++) seg(s0, g(c.day[i]), g(c.day[(i + 1) % c.day.length]));
-        grp.steps.push(s0);
-        const s = St(par && isFresh(hN)
-          ? `Trong ${trio(par.vn, par.wn, par.un)}, kẻ ${c.dinh}${hN} ∥ ${pair(par.vn, par.wn)} (${hN} ∈ ${pair(par.wn, par.un)}). Vì ${pair(par.vn, par.wn)} ⊥ ${nicePlane(pl, bn)} nên ${c.dinh}${hN} ⊥ ${nicePlane(pl, bn)}: ${c.dinh}${hN} là đường cao`
-          : isFresh(hN) ? `Gọi ${hN} là hình chiếu vuông góc của ${c.dinh} lên ${bn}; ${c.dinh}${hN} là đường cao` : `${c.dinh}${hN} là đường cao`);
-        if (par) grp.thales = { x: c.dinh, f: hN, ...par };
-        seg(s, X, H, { emph: true }); const Y = other(H, c.day); if (Y) mark(s, "right", H, X, Y); pt(s, hN);
+      }
+      return best;
+    }
+    function emitVol(grp, vp) {
+      let f = 1;
+      if (vp.swap && vp.swap.par) {
+        const { apex, yn, par, base } = vp.swap, B = base.join("");
+        grp.steps.push(St(`Vì ${pair(apex, yn)} ∥ ${par[0] === apex && par[1] === yn ? "(" + B + ")" : pair(par[0], par[1]) + " nên " + pair(apex, yn) + " ∥ (" + B + ")"}${par[0] === apex && par[1] === yn ? "" : ""} nên V(${apex}.${B}) = V(${yn}.${B})`));
+      } else if (vp.swap) {
+        const { apex, yn, I, iN, line, r, base } = vp.swap;
+        const nm = iN || alloc(I, ["K", "I", "E", "F"]);
+        const rs = frac(r), B = base.join("");
+        const st = St(`${iN ? "" : "Gọi " + nm + " là giao điểm của " + pair(apex, yn) + " và " + pair(line[0], line[1]) + ". "}Vì ${pair(apex, yn)} cắt (${B}) tại ${nm} và ${apex}${nm} = ${rs === "1" ? "" : rs + "·"}${yn}${nm} nên V(${apex}.${B}) = ${rs === "1" ? "" : rs + "·"}V(${yn}.${B})`);
+        seg(st, g(apex), I, { thin: true }); seg(st, g(yn), I, { thin: true }); pt(st, nm);
+        grp.steps.push(st);
+        f = r;
+      }
+      if (vp.relabel) {
+        const [a0, b0] = vp.relabel.to;
+        const from = vp.swap ? vp.swap.yn : vp.relabel.from[0];
+        const fromBase = vp.relabel.from[1];
+        grp.steps.push(St(`V(${from}.${fromBase.join("")}) = V(${a0}.${b0.join("")})`));
+      }
+      const { xn, base, pl, H } = vp, X = g(xn), B = base.join("");
+      // đáy nằm trong một mặt của khối thì gọi tên mặt đó, nếu không thì gọi theo đáy
+      const bface = M.solid?.faces.find((fc) => { try { const fp = TM.planeOf(M, fc.names.slice(0, 3)); return base.every((n) => onPl(g(n), fp)); } catch { return false; } });
+      const bn = bface ? PN(bface.names.slice(0, 3)) : "(" + B + ")";
+      const s0 = St(`Đáy ${B}`);
+      s0.polys.push({ pts: base.map(g) });
+      for (let i = 0; i < base.length; i++) seg(s0, g(base[i]), g(base[(i + 1) % base.length]));
+      grp.steps.push(s0);
+      let hName;
+      if (vp.kind === "dm") {
+        hName = emitDM(grp, xn, pl, bn, vp.q);
+      } else {
+        const hN = vp.kind === "named" ? vp.hn : alloc(H, vp.kind === "par" ? ["E", "F", "I", "K", "H"] : ["H", "O", "K"]);
+        let txt;
+        if (vp.kind === "named") txt = `${xn}${hN} ⊥ ${bn} nên ${xn}${hN} là đường cao`;
+        else if (vp.kind === "planes") {
+          const fn = PN(vp.face.names.slice(0, 3)), [e1, e2] = vp.edge;
+          txt = `Vì ${xn} ∈ ${fn} và ${fn} ∥ ${bn} nên d(${xn}, ${bn}) = ${pair(e1, e2)}`;
+        } else if (vp.kind === "par") {
+          txt = `Trong ${trio(vp.vn, vp.wn, vp.un)}, kẻ ${xn}${hN} ∥ ${pair(vp.vn, vp.wn)} (${hN} ∈ ${pair(vp.wn, vp.un)}). Vì ${pair(vp.vn, vp.wn)} ⊥ ${bn} nên ${xn}${hN} ⊥ ${bn}: ${xn}${hN} là đường cao`;
+          if (vp.onVU) grp.thales = { x: xn, f: hN, vn: vp.vn, wn: vp.wn, un: vp.un };
+        } else txt = `Gọi ${hN} là hình chiếu vuông góc của ${xn} lên ${bn}; ${xn}${hN} là đường cao`;
+        const s = St(txt);
+        if (vp.kind === "planes") { const [e1, e2] = vp.edge; seg(s, g(e1), g(e2), { emph: true }); }
+        else { seg(s, X, H, { emph: true }); const Y = other(H, base); if (Y) mark(s, "right", H, X, Y); pt(s, hN); }
         grp.steps.push(s);
-        grp.result = `V = ⅓ · S(${c.day.join("")}) · ${c.dinh}${hN}`;
+        hName = vp.kind === "planes" ? pair(...vp.edge) : xn + hN;
+      }
+      const rs = frac(f);
+      grp.result = `V = ${rs === "1" ? "" : rs + "·"}⅓ · S(${B}) · ${hName}`;
+      grp.vol = { f, apex: xn, base, h: Math.abs(sd(X, pl)) };
+    }
+
+    function theTich(grp, c) {
+      if (c && c.dinh && Array.isArray(c.day) && c.day.length >= 3) {
+        const vp = bestVol(c.dinh, c.day);
+        if (!vp) return;
+        emitVol(grp, vp);
         return;
       }
       const S = M.solid;
@@ -2635,11 +2966,17 @@ const TMAux = (() => {
           return;
         }
       }
-      const s2 = St(`Tâm mặt cầu ${iN} nằm trên Δ và ${iN}${v0} = ${iN}${base[0]}; bán kính R = ${iN}${base[0]}`);
-      seg(s2, I, V0, { emph: true }); seg(s2, I, g(base[0]), { emph: true });
-      pt(s2, iN, lo, hi);
-      grp.steps.push(s2);
-      grp.result = `R = ${iN}${base[0]}`;
+      // tổng quát: mặt phẳng trung trực của một cạnh bên v0W cắt trục Δ tại tâm I
+      {
+        const wN2 = base[0], W2 = g(wN2), E2 = mul(add(V0, W2), 0.5);
+        const eN = alloc(E2, ["E", "M", "N", "K"]);
+        const vw = pair(v0, wN2);
+        const s2 = St(`${isFresh(eN) ? "Gọi " + eN + " là trung điểm " + vw + "; " : ""}mặt phẳng trung trực của ${vw} (qua ${eN}, vuông góc với ${vw}) cắt Δ tại ${iN}. Khi đó ${iN}${v0} = ${iN}${wN2} và ${iN} cách đều các đỉnh đáy: ${iN} là tâm mặt cầu, R = ${iN}${wN2}`);
+        seg(s2, E2, I, { thin: true }); mark(s2, "right", E2, I, V0); seg(s2, I, V0, { emph: true }); seg(s2, I, W2, { emph: true });
+        pt(s2, eN); pt(s2, iN, lo, hi);
+        grp.steps.push(s2);
+        grp.result = `R = ${iN}${wN2}`;
+      }
     }
 
     function giaoTuyen(c, grp) {
@@ -2867,6 +3204,18 @@ const TMAux = (() => {
       let m = null;
       try { m = TM.measure(c, M); } catch { m = null; }
       const lastArc = () => { for (let i = grp.steps.length - 1; i >= 0; i--) { const mk = grp.steps[i].marks.filter((x) => x.kind === "arc").pop(); if (mk) return mk; } return null; };
+      if (/^khoang_cach/.test(c.loai) && grp.volMethod && grp.vol) {
+        const { tri, xn } = grp.volMethod, P = tri.map(g);
+        const S3 = len(cross(sub(P[1], P[0]), sub(P[2], P[0]))) / 2;
+        const bP = grp.vol.base.map(g);
+        let Sb = 0;
+        for (let i = 1; i + 1 < bP.length; i++) Sb += len(cross(sub(bP[i], bP[0]), sub(bP[i + 1], bP[0]))) / 2;
+        const V = grp.vol.f * Sb * grp.vol.h / 3;
+        out.push(`S(${grp.vol.base.join("")}) = ${exS(Sb, 2)}, chiều cao = ${exS(grp.vol.h)} ⇒ V(${xn}.${tri.join("")}) = ${exS(V, 3)}`);
+        out.push(`S(${tri.join("")}) = ${exS(S3, 2)}`);
+        if (m) out.push(`Đáp số: ${m.label.replace(/^Khoảng cách/, "khoảng cách")} = 3V/S = ${exS(m.v)}`);
+        return out;
+      }
       if (/^khoang_cach/.test(c.loai)) {
         const mt = /=\s*(?:(\d+(?:\/\d+)?)·)?([A-Z][A-Za-z'₁₂]*)\s*$/.exec(grp.result || "");
         const sp = mt && splitName(mt[2]);
@@ -2881,7 +3230,12 @@ const TMAux = (() => {
         return out;
       }
       if (/^goc_/.test(c.loai) || c.loai === "goc") {
-        if (/sin φ/.test(grp.result || "") && m) {
+        if (grp.projArea && m) {
+          const area = (ns) => { const P = ns.map(g); return len(cross(sub(P[1], P[0]), sub(P[2], P[0]))) / 2; };
+          const { tri, pro } = grp.projArea;
+          out.push(`S(${pro.join("")}) = ${exS(area(pro), 2)}, S(${tri.join("")}) = ${exS(area(tri), 2)}`);
+          out.push(`cos φ = S(${pro.join("")}) / S(${tri.join("")}) = ${TM.exact(area(pro) / area(tri)) || TM.fmt(area(pro) / area(tri))}`);
+        } else if (/sin φ/.test(grp.result || "") && m) {
           out.push(`sin φ = ${TM.exact(Math.sin(m.v * TM.DEG)) || TM.fmt(Math.sin(m.v * TM.DEG))}`);
         } else {
           const mk = lastArc();
@@ -2903,8 +3257,8 @@ const TMAux = (() => {
       }
       if (c.loai === "the_tich" && m) {
         const S = M.solid;
-        const base = c.dinh && Array.isArray(c.day) ? c.day : S ? S.base : null;
-        const top = c.dinh && Array.isArray(c.day) ? c.dinh : S ? (S.kind === "chop" ? S.apex : S.top[0]) : null;
+        const base = grp.vol ? grp.vol.base : c.dinh && Array.isArray(c.day) ? c.day : S ? S.base : null;
+        const top = grp.vol ? grp.vol.apex : c.dinh && Array.isArray(c.day) ? c.dinh : S ? (S.kind === "chop" ? S.apex : S.top[0]) : null;
         if (base && top) {
           const P = base.map(g), pl = plane(base.slice(0, 3));
           let area = 0;
@@ -2916,7 +3270,8 @@ const TMAux = (() => {
           }
           const prism = !(c.dinh && Array.isArray(c.day)) && S && S.kind !== "chop";
           out.push(`S(${base.join("")}) = ${exS(area, 2)}, chiều cao = ${exS(h)}`);
-          out.push(`Đáp số: V = ${prism ? "" : "⅓·"}S·h = ${exS(m.v, 3)}`);
+          const fr = grp.vol && Math.abs(grp.vol.f - 1) > 1e-9 ? frac(grp.vol.f) + "·" : "";
+          out.push(`Đáp số: V = ${fr}${prism ? "" : "⅓·"}S·h = ${exS(m.v, 3)}`);
         }
         return out;
       }
@@ -2936,7 +3291,7 @@ const TMAux = (() => {
       goc_duong_mat: (c) => (grp) => gocDuongMat(c, grp),
       goc_hai_mat: (c) => (grp) => gocHaiMat(c, grp),
       goc_hai_duong: (c) => (grp) => gocHaiDuong(c, grp),
-      khoang_cach_diem_mat: (c) => (grp) => diemMat(grp, c.diem, plane(c.mat), PN(c.mat)),
+      khoang_cach_diem_mat: (c) => (grp) => diemMat(grp, c.diem, plane(c.mat), PN(c.mat), null, c.mat),
       khoang_cach_diem_duong: (c) => (grp) => diemDuong(grp, c.diem, (c.duong || [])[0], (c.duong || [])[1]),
       khoang_cach_hai_duong: (c) => (grp) => haiDuong(c, grp),
       the_tich: (c) => (grp) => theTich(grp, c),
@@ -2969,7 +3324,7 @@ const TMAux = (() => {
     for (const c of Array.isArray(spec?.dieu_kien) ? spec.dieu_kien : []) {
       if (c && /^(goc_|khoang_cach)/.test(c.loai) && handlers[c.loai]) run(c, handlers[c.loai](c), true);
     }
-    out.groups = out.groups.filter((gp) => gp.steps.length || gp.result);
+    out.groups = out.groups.filter((gp) => gp.steps.length || gp.result || gp.err);
     return out;
   }
 
