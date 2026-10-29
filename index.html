@@ -1140,7 +1140,21 @@ const TM = (() => {
       if (moved) { slow = true; r = run(); }
     }
     const tol = (hi - lo) * 1e-6;
+    // đầu mút có thuộc miền khảo sát không: không dựng được hình, hoặc hình suy biến (diện tích/thể tích bằng 0) thì loại
+    const endState = (e) => {
+      try {
+        const pv = slow ? solve(spec, params, { ...free, [bien]: e }, {}).pv : { ...pv0, [bien]: e };
+        const M2 = build(spec, pv, {}, { locked });
+        if (M2.errors.length) return "nan";
+        const me = measure(inner, M2);
+        if (!isFinite(me.v)) return "nan";
+        if ((me.kind === "area" || me.kind === "volume") && Math.abs(me.v) < 1e-9 * Math.max(1, Math.abs(r.v))) return "zero";
+        return null;
+      } catch { return "nan"; }
+    };
     const out = { v: r.v, at: r.at, bien, edge: Math.abs(r.at - lo) < tol ? "lo" : Math.abs(r.at - hi) < tol ? "hi" : null };
+    out.loBad = out.edge === "lo" ? null : endState(lo);
+    out.hiBad = out.edge === "hi" ? null : endState(hi);
     if (OPT_CACHE.size > 60) OPT_CACHE.clear();
     OPT_CACHE.set(key, out);
     return out;
@@ -1225,7 +1239,7 @@ const TM = (() => {
         const m0 = measure(inner, M);
         const r = optimize(M, c, inner);
         const lab = m0.label.charAt(0).toLowerCase() + m0.label.slice(1);
-        return { v: r.v, kind: m0.kind, label: `Giá trị ${c.tim === "min" ? "nhỏ" : "lớn"} nhất của ${lab}`, at: r.at, bien: r.bien, edge: r.edge, opt: c.tim === "min" ? "min" : "max" };
+        return { v: r.v, kind: m0.kind, label: `Giá trị ${c.tim === "min" ? "nhỏ" : "lớn"} nhất của ${lab}`, at: r.at, bien: r.bien, edge: r.edge, loBad: r.loBad, hiBad: r.hiBad, opt: c.tim === "min" ? "min" : "max" };
       }
       case "mat_cau": {
         const pts = c.dinh && Array.isArray(c.day) ? [c.dinh, ...c.day] : null;
@@ -2346,6 +2360,46 @@ const TMAux = (() => {
         const { u, w } = plan;
         const hN = alloc(H, ["H", "K"]);
         let txtA = `Kẻ ${xn}${hN} ⊥ ${pair(u, w)} tại ${hN}. Khi đó ${xn}${hN} ⊥ ${mn}`;
+        if (isFresh(hN)) {
+          // nêu đủ lý do như sách: tìm đường l trong mặt phẳng cần tính, l ⊥ (X u w) nhờ hai đường cắt nhau trong (X u w);
+          // suy ra l ⊥ XH, kết hợp XH ⊥ uw thì XH ⊥ mặt phẳng (ví dụ: BC ⊥ AB, BC ⊥ SA ⇒ BC ⊥ (SAB) ⇒ BC ⊥ AH)
+          try {
+            const dir = (a, b) => TM.vec.unit(sub(g(b), g(a)));
+            const perp2 = (a, b, c, d) => Math.abs(dot(dir(a, b), dir(c, d))) < 1e-7;
+            const par2 = (a, b, c, d) => len(cross(dir(a, b), dir(c, d))) < 1e-7;
+            const Q = TM.planeOf(M, [xn, u, w]);
+            const inBase = (a, b) => !!basePlane && onPl(g(a), basePlane) && onPl(g(b), basePlane);
+            // đường l nằm trong mặt phẳng cần tính và vuông góc với giao tuyến uw thì l ⊥ (X u w)
+            const ls = linesOn(pl).filter(([a, b]) => perp2(a, b, u, w));
+            const kl = (l) => (l[2] ? 1 : 0) + (inBase(l[0], l[1]) ? 0 : 0.5);
+            const l2 = ls.sort((x, y) => kl(x) - kl(y))[0];
+            if (l2) {
+              const why2 = (c, d) => (isVert(c, d) && inBase(l2[0], l2[1]) ? ` (do ${pair(c, d)} ⊥ ${PN(M.solid.base.slice(0, 3))})` : "");
+              const scQ = (l) => (l[2] ? 1 : 0) + (why2(l[0], l[1]) ? 0 : 0.5);
+              const inQ = linesOn(Q).filter(([c, d]) => perp2(l2[0], l2[1], c, d) && !par2(c, d, u, w)).sort((x, y) => scQ(x) - scQ(y));
+              const c1 = inQ[0], c2 = c1 && inQ.find((l) => !par2(l[0], l[1], c1[0], c1[1]));
+              const ln = pair(l2[0], l2[1]);
+              const QisBase = !!basePlane && [xn, u, w].every((n) => onPl(g(n), basePlane));
+              if (QisBase && isVert(l2[0], l2[1])) {
+                // l là đường cao của khối (vuông góc với đáy chứa X, u, w): dùng thẳng giả thiết
+                txtA = `Kẻ ${xn}${hN} ⊥ ${pair(u, w)} tại ${hN}. Vì ${ln} ⊥ ${PN(M.solid.base.slice(0, 3))} nên ${ln} ⊥ ${xn}${hN}, do đó ${xn}${hN} ⊥ ${mn}`;
+              } else if (c1 && c2) {
+                // cạnh có lý do sẵn (⊥ đáy) đặt sau cho câu gọn: "BC ⊥ AB và BC ⊥ SA (do SA ⊥ (ABCD))"
+                const [e1, e2] = why2(c1[0], c1[1]) && !why2(c2[0], c2[1]) ? [c2, c1] : [c1, c2];
+                // gọi tên mặt phẳng theo hai đường vừa nêu (BC ⊥ AB, BC ⊥ SA ⇒ BC ⊥ (SAB)) cho dễ theo dõi
+                const offL = (p, a, b) => len(cross(sub(g(p), g(a)), sub(g(b), g(a)))) > 1e-7 * len(sub(g(b), g(a))) * Math.max(1, len(sub(g(p), g(a))));
+                const p3 = [e2[0], e2[1]].find((p) => offL(p, e1[0], e1[1]));
+                const nm3 = p3 ? [e1[0], e1[1], p3] : [xn, u, w];
+                const pn3 = PN(nm3);
+                const Qn = pn3 === "(" + nm3.join("") + ")" ? trio(...nm3) : pn3; // không phải mặt của khối: viết theo thứ tự quen (SAC)
+                txtA = `Kẻ ${xn}${hN} ⊥ ${pair(u, w)} tại ${hN}. Vì ${ln} ⊥ ${pair(e1[0], e1[1])}${why2(e1[0], e1[1])} và ${ln} ⊥ ${pair(e2[0], e2[1])}${why2(e2[0], e2[1])} nên ${ln} ⊥ ${Qn}, suy ra ${ln} ⊥ ${xn}${hN}. `
+                  + `Do đó ${xn}${hN} ⊥ ${mn}`;
+              } else {
+                txtA = `Kẻ ${xn}${hN} ⊥ ${pair(u, w)} tại ${hN}. Vì ${ln} ⊥ ${PN([xn, u, w])} nên ${ln} ⊥ ${xn}${hN}, do đó ${xn}${hN} ⊥ ${mn}`;
+              }
+            }
+          } catch { /* giữ câu ngắn */ }
+        }
         if (!isFresh(hN)) {
           // điểm H có sẵn: chỉ ra hai đường cắt nhau tại H trong mặt phẳng cùng vuông góc với XH
           // đường thứ hai: ưu tiên cạnh của khối (ví dụ BC, vì BC ⊥ (SAB)), sau đó mới tới đường qua H
@@ -2376,7 +2430,16 @@ const TMAux = (() => {
         seg(s1, X, K); mark(s1, "right", K, X, other(K, [u, w])); extend(s1, K, U, W); pt(s1, kN, U, W);
         grp.steps.push(s1);
         const hN = alloc(H, ["K", "H", "I", "J"]);
-        const s2 = St(`${isFresh(hN) ? "Kẻ" : "Ta có"} ${xn}${hN} ⊥ ${vn}${kN}${isFresh(hN) ? " tại " + hN : ""}. Khi đó ${xn}${hN} ⊥ ${mn}`);
+        // lý do như sách: uw ⊥ XK và uw ⊥ XV ⇒ uw ⊥ (VXK) ⇒ uw ⊥ XH; mà XH ⊥ VK nên XH ⊥ mặt phẳng
+        let whyB = `. Khi đó ${xn}${hN} ⊥ ${mn}`;
+        try {
+          const du = TM.vec.unit(sub(W, U)), dv = TM.vec.unit(sub(V, X));
+          if (Math.abs(dot(du, dv)) < 1e-7) {
+            const vr = isVert(xn, vn) && basePlane ? ` (do ${pair(xn, vn)} ⊥ ${PN(M.solid.base.slice(0, 3))})` : "";
+            whyB = `. Vì ${pair(u, w)} ⊥ ${xn}${kN} và ${pair(u, w)} ⊥ ${pair(xn, vn)}${vr} nên ${pair(u, w)} ⊥ ${trio(vn, xn, kN)}, suy ra ${pair(u, w)} ⊥ ${xn}${hN}. Do đó ${xn}${hN} ⊥ ${mn}`;
+          }
+        } catch { /* giữ câu ngắn */ }
+        const s2 = St(`${isFresh(hN) ? "Kẻ" : "Ta có"} ${xn}${hN} ⊥ ${vn}${kN}${isFresh(hN) ? " tại " + hN : ""}${whyB}`);
         seg(s2, V, K); extend(s2, H, V, K); seg(s2, X, H, { emph: true }); mark(s2, "right", H, X, same(V, H) ? K : V); pt(s2, hN, V, K);
         grp.steps.push(s2);
         return xn + hN;
@@ -2407,7 +2470,7 @@ const TMAux = (() => {
           return xn + vN;
         }
         const hN = alloc(H, ["K", "H", "I", "J"]);
-        const s3 = St(`${isFresh(hN) ? "Kẻ" : "Ta có"} ${xn}${hN} ⊥ ${kN}${vN}${isFresh(hN) ? " tại " + hN : ""}. Khi đó ${xn}${hN} ⊥ ${mn}`);
+        const s3 = St(`${isFresh(hN) ? "Kẻ" : "Ta có"} ${xn}${hN} ⊥ ${kN}${vN}${isFresh(hN) ? " tại " + hN : ""}. Vì ${trio(xn, kN, vN)} ⊥ ${mn}, ${trio(xn, kN, vN)} ∩ ${mn} = ${kN}${vN} và ${xn}${hN} nằm trong ${trio(xn, kN, vN)} nên ${xn}${hN} ⊥ ${mn}`);
         seg(s3, X, H, { emph: true }); extend(s3, H, K, V); mark(s3, "right", H, X, same(V, H) ? K : V); pt(s3, hN, K, V);
         grp.steps.push(s3);
         return xn + hN;
@@ -4006,7 +4069,15 @@ const TMAux = (() => {
         let lo = null, hi = null;
         try { lo = c.tu != null ? TM.evalExpr(c.tu, pv) : null; hi = c.den != null ? TM.evalExpr(c.den, pv) : null; } catch { lo = hi = null; }
         const vt = (x) => varText(c, x).replace(/^= /, "");
-        if (lo != null && hi != null) out.push(`Cho ${m.bien} chạy trong [${vt(lo)}; ${vt(hi)}] và khảo sát ${m.label.replace(/^Giá trị (lớn|nhỏ) nhất của /, "")}`);
+        if (lo != null && hi != null) {
+          // đầu mút làm hình suy biến (hoặc không dựng được) thì dùng ngoặc tròn và nói rõ lý do
+          const why = (k) => `hình bị suy biến (${k === "zero" ? (m.kind === "volume" ? "thể tích" : "diện tích") + " bằng 0" : "không xác định được đại lượng cần xét"})`;
+          const bad = [[lo, m.loBad], [hi, m.hiBad]].filter(([, k]) => k);
+          const note = !bad.length ? ""
+            : bad.length === 2 && bad[0][1] === bad[1][1] ? `; tại ${m.bien} = ${vt(lo)} và ${m.bien} = ${vt(hi)} ${why(bad[0][1])} nên loại hai đầu mút`
+              : "; " + bad.map(([x, k]) => `tại ${m.bien} = ${vt(x)} ${why(k)}`).join(", ") + ` nên loại ${bad.length === 2 ? "hai đầu mút" : "đầu mút này"}`;
+          out.push(`Cho ${m.bien} chạy trong ${m.loBad ? "(" : "["}${vt(lo)}; ${vt(hi)}${m.hiBad ? ")" : "]"}${note}. Khảo sát ${m.label.replace(/^Giá trị (lớn|nhỏ) nhất của /, "")} trên khoảng này`);
+        }
         out.push(`Đáp số: giá trị ${m.opt === "min" ? "nhỏ" : "lớn"} nhất bằng ${exM(m)}, đạt khi ${m.bien} ${varText(c, m.at)}`);
         return out;
       }
