@@ -2506,7 +2506,7 @@ const TMAux = (() => {
           if (!okLine && !parL) continue;
           ratio = 1;
           tr = parL
-            ? { extra: okLine ? 0 : 0.2, why: () => `Vì ${pair(xn, yn)} ∥ ${pair(parL[0], parL[1])} nên ${pair(xn, yn)} ∥ ${mn}, suy ra d(${xn}, ${mn}) = d(${yn}, ${mn})` }
+            ? { extra: okLine ? 0 : 0.2, why: () => `Vì ${pair(xn, yn)} ∥ ${pair(parL[0], parL[1])}, ${pair(parL[0], parL[1])} ⊂ ${mn} và ${pair(xn, yn)} ⊄ ${mn} nên ${pair(xn, yn)} ∥ ${mn}, suy ra d(${xn}, ${mn}) = d(${yn}, ${mn})` }
             : { why: () => `Vì ${pair(xn, yn)} ∥ ${mn} nên d(${xn}, ${mn}) = d(${yn}, ${mn})` };
         } else {
           const I = add(X, mul(v, -sd(X, pl) / den));
@@ -2628,7 +2628,11 @@ const TMAux = (() => {
             const H = footPl(g(xn), pl);
             return { xn, sc: (nameIn(H) ? 0 : 1) + (namedSegs.some(([s1, s2]) => onPl(g(s1), pl) && onPl(g(s2), pl) && onLine(H, g(s1), g(s2))) ? 0 : 0.5) };
           }).sort((m1, m2) => m1.sc - m2.sc)[0].xn;
-          diemMat(grp, pick, pl, fn, `Vì ${x1}${x2} ∥ ${fn} nên d(${a}${b}, ${p}${q}) = d(${x1}${x2}, ${fn}) = d(${pick}, ${fn})`);
+          // tìm một đường của mặt song song với x1x2 để câu lý do đủ điều kiện
+          const fe = f.map((n, i) => [n, f[(i + 1) % f.length]]).concat(namedSegs.filter(([s1, s2]) => onPl(g(s1), pl) && onPl(g(s2), pl)))
+            .find(([e1, e2]) => len(cross(sub(g(e2), g(e1)), dir)) < 1e-6 * len(dir) * len(sub(g(e2), g(e1))));
+          const parWhy = fe ? `Vì ${x1}${x2} ∥ ${pair(fe[0], fe[1])}, ${pair(fe[0], fe[1])} ⊂ ${fn} và ${x1}${x2} ⊄ ${fn} nên ${x1}${x2} ∥ ${fn}, suy ra` : `Vì ${x1}${x2} ∥ ${fn} nên`;
+          diemMat(grp, pick, pl, fn, `${parWhy} d(${a}${b}, ${p}${q}) = d(${x1}${x2}, ${fn}) = d(${pick}, ${fn})`);
           grp.result = `d(${a}${b}, ${p}${q}) = ${grp.result.split(" = ").pop()}`;
           return;
         }
@@ -2777,7 +2781,7 @@ const TMAux = (() => {
         seg(s2, g(xo), F);
         s2.polys.push({ pts: [g(x1), g(x2), F] }); // tô nhạt mặt phẳng phụ
         if (jWay && (!opts.length || jWay.score < opts[0].best.score)) {
-          s2.desc = `Khi đó ${pair(y1, y2)} ∥ ${sn} nên d(${a}${b}, ${p}${q}) = d(${pair(y1, y2)}, ${sn})`;
+          s2.desc = `Khi đó ${pair(y1, y2)} ∥ ${ellName}, ${ellName} ⊂ ${sn} và ${pair(y1, y2)} ⊄ ${sn} nên ${pair(y1, y2)} ∥ ${sn}, suy ra d(${a}${b}, ${p}${q}) = d(${pair(y1, y2)}, ${sn})`;
           grp.steps.push(s2);
           const { I, J, K, ratio } = jWay;
           const iN = alloc(I, ["E", "I", "H", "F"]);
@@ -2800,7 +2804,7 @@ const TMAux = (() => {
         }
         if (!opts.length) throw new Error("không dựng được");
         const { yn, best } = opts[0];
-        s2.desc = `Khi đó ${pair(y1, y2)} ∥ ${sn} nên d(${a}${b}, ${p}${q}) = d(${pair(y1, y2)}, ${sn})` + (opts[0].lead ? "" : ` = d(${yn}, ${sn})`);
+        s2.desc = `Khi đó ${pair(y1, y2)} ∥ ${ellName}, ${ellName} ⊂ ${sn} và ${pair(y1, y2)} ⊄ ${sn} nên ${pair(y1, y2)} ∥ ${sn}, suy ra d(${a}${b}, ${p}${q}) = d(${pair(y1, y2)}, ${sn})` + (opts[0].lead ? "" : ` = d(${yn}, ${sn})`);
         grp.steps.push(s2);
         if (opts[0].lead) {
           const s5 = St(opts[0].lead + `; d(${pair(y1, y2)}, ${sn}) = d(${yn}, ${sn})`);
@@ -2938,6 +2942,7 @@ const TMAux = (() => {
       if (c.duong && c.mat) {
         const [p, q] = c.duong, pl = plane(c.mat), pn = PN(c.mat);
         if (perp) { if (lineVsPlane(grp, p, q, pl, pn)) grp.result = `${pair(p, q)} ⊥ ${pn}`; return; }
+        if (onPl(g(p), pl) && onPl(g(q), pl)) { grp.result = `${pair(p, q)} nằm trong ${pn} nên không song song với ${pn}`; return; }
         const u = sub(g(q), g(p));
         const l = linesIn(pl).sort((x, y) => (x[2] ? 1 : 0) - (y[2] ? 1 : 0)).find(([a, b]) => par(sub(g(b), g(a)), u));
         if (!l) {
@@ -2962,12 +2967,12 @@ const TMAux = (() => {
           if (!bp) { grp.result = `Chưa tìm được đường thẳng có sẵn trong ${pn} song song với ${pair(p, q)}`; return; }
           const yN = alloc(bp.Y, ["I", "E", "K", "F"]);
           const ue = pair(bp.e1, bp.e2);
-          const s = St(`${Math.abs(bp.t - 0.5) < 1e-6 && isFresh(yN) ? "Gọi " + yN + " là trung điểm " + ue + ", ta có " + bp.xn + yN + " ∥ " + pair(p, q) : "Lấy " + yN + " trên " + ue + " sao cho " + bp.xn + yN + " ∥ " + pair(p, q)}. Mà ${bp.xn}${yN} ⊂ ${pn} nên ${pair(p, q)} ∥ ${pn}`);
+          const s = St(`${Math.abs(bp.t - 0.5) < 1e-6 && isFresh(yN) ? "Gọi " + yN + " là trung điểm " + ue + ", ta có " + bp.xn + yN + " ∥ " + pair(p, q) : "Lấy " + yN + " trên " + ue + " sao cho " + bp.xn + yN + " ∥ " + pair(p, q)}. Mà ${bp.xn}${yN} ⊂ ${pn} và ${pair(p, q)} ⊄ ${pn} nên ${pair(p, q)} ∥ ${pn}`);
           seg(s, g(p), g(q), { emph: true }); seg(s, bp.X, bp.Y, { emph: true }); pt(s, yN);
           grp.steps.push(s); grp.result = `${pair(p, q)} ∥ ${pn}`;
           return;
         }
-        const s = St(`${pair(p, q)} ∥ ${pair(l[0], l[1])} mà ${pair(l[0], l[1])} ⊂ ${pn} nên ${pair(p, q)} ∥ ${pn}`);
+        const s = St(`${pair(p, q)} ∥ ${pair(l[0], l[1])} mà ${pair(l[0], l[1])} ⊂ ${pn} và ${pair(p, q)} ⊄ ${pn} nên ${pair(p, q)} ∥ ${pn}`);
         seg(s, g(p), g(q), { emph: true }); seg(s, g(l[0]), g(l[1]), { emph: true });
         grp.steps.push(s); grp.result = `${pair(p, q)} ∥ ${pn}`;
         return;
@@ -3157,7 +3162,7 @@ const TMAux = (() => {
       let f = 1;
       if (vp.swap && vp.swap.par) {
         const { apex, yn, par, base } = vp.swap, B = base.join("");
-        grp.steps.push(St(`Vì ${pair(apex, yn)} ∥ ${par[0] === apex && par[1] === yn ? "(" + B + ")" : pair(par[0], par[1]) + " nên " + pair(apex, yn) + " ∥ (" + B + ")"}${par[0] === apex && par[1] === yn ? "" : ""} nên V(${apex}.${B}) = V(${yn}.${B})`));
+        grp.steps.push(St(`Vì ${pair(apex, yn)} ∥ ${par[0] === apex && par[1] === yn ? "(" + B + ")" : pair(par[0], par[1]) + ", " + pair(par[0], par[1]) + " ⊂ (" + B + ") và " + pair(apex, yn) + " ⊄ (" + B + ") nên " + pair(apex, yn) + " ∥ (" + B + ")"} nên V(${apex}.${B}) = V(${yn}.${B})`));
       } else if (vp.swap) {
         const { apex, yn, I, iN, line, r, base } = vp.swap;
         const nm = iN || alloc(I, ["K", "I", "E", "F"]);
@@ -3640,7 +3645,7 @@ const TMAux = (() => {
         const news = [[v1, V1], [v2, V2]].filter(([n]) => !before.has(n));
         let desc;
         if (parFace) desc = `Vì ${fname(d.trace)} ∥ ${fname(f)} nên trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${d.name}`;
-        else if (d.trace) desc = `Vì ${d.name} ∥ ${alt} nên ${d.name} ∥ ${fname(f)}; trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${alt}`;
+        else if (d.trace) desc = `Vì ${d.name} ∥ ${alt}, ${alt} ⊂ ${fname(f)} và ${d.name} ⊄ ${fname(f)} nên ${d.name} ∥ ${fname(f)}; trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${alt}`;
         else if (inF || !alt) desc = `Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${d.name}`;
         else desc = `Trong ${fname(f)}, qua ${k.n} kẻ đường thẳng song song với ${alt} (vì ${alt} ∥ ${d.name})`;
         const s = St(desc + cutText(news));
